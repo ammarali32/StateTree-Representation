@@ -1,0 +1,8 @@
+statetree
+Copyright 2026 Ammar Ali, LEAD lab, ITMO University
+
+The fused GEMM kernel (tm) follows the structure of Marlin
+(https://github.com/IST-DASLab/marlin, Apache-2.0, Copyright Elias Frantar et al.):
+stream-K work split, cp.async multi-stage pipeline, XOR-swizzled activation tiles,
+ldmatrix + mma.sync, and fp32 partial-sum reduction through a global workspace.
+The INT4 dequantization of Marlin is replaced by the lossless state-tree decode.

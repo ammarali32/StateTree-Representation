@@ -1,0 +1,2 @@
+include README.md LICENSE NOTICE
+recursive-include statetree/csrc *.cu *.cpp

@@ -1,0 +1,10 @@
+__pycache__/
+*.so
+build/
+dist/
+*.egg-info/
+results/
+tests/_out/
+llama32_1b_statetree/
+install*.log
+.ipynb_checkpoints/
