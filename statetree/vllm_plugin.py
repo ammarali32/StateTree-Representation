@@ -30,7 +30,7 @@ a shape is seen, cached in ~/.cache/statetree/tune.json).
 Environment: STATETREE_VLLM_VERIFY=0 skips the load-time bit-exactness check; STATETREE_VLLM_EMBEDDINGS=0 keeps the
 embedding and lm_head in BF16; STATETREE_AUTOTUNE=0 uses heuristics.
 """
-REPRESENTATIONS = ("bf16", "statetree")
+REPRESENTATIONS = ("bf16", "statetree", "dense16")    # dense16: ablation control
 
 
 def register():

@@ -2,7 +2,8 @@
 
 A BF16 weight is sign | 8-bit exponent | 7-bit mantissa. Every row is cut into groups of 64 weights; the group's
 largest exponent E is the tree node, each weight keeps a 4-bit state D = E - exponent and an 8-bit leaf (sign and
-mantissa). D = 15 marks an escape (|w| < 2^-14 of the group's largest weight, ~0.01% of LLM weights) whose exact bits
+mantissa; leaf format v2: mantissa << 1 | sign of its pair partner, the two weights of a bf16 pair holding each
+other's sign, which the kernels decode with two byte permutes and two 1-bit rotates). D = 15 marks an escape (|w| < 2^-14 of the group's largest weight, ~0.01% of LLM weights) whose exact bits
 are kept in a side list. 12.125 bits/weight + escapes, every weight decodes to its exact BF16 bits.
 
 Storage unit: one 1552-byte record per 16-row x 64-column block, laid out in mma.m16n8k16 A-fragment order:
@@ -13,7 +14,30 @@ Storage unit: one 1552-byte record per 16-row x 64-column block, laid out in mma
 import torch
 
 RECORD_BYTES = 1552
+LEAF_FORMAT = 2                     # 1: s << 7 | m (statetree <= 0.3), 2: m << 1 | partner sign (>= 0.4)
 PERM = [16 * (p // 4) + 2 * t + (p % 2) + 8 * ((p // 2) % 2) for t in range(4) for p in range(16)]
+
+
+def _v2(lv):
+    """leaf bytes s << 7 | m -> m << 1 | sign of the pair partner (bytes 0-1 and 2-3 of every 4-byte leaf word)"""
+    w = lv.reshape(*lv.shape[:-1], -1, 4)
+    part = w[..., [1, 0, 3, 2]]
+    return (((w & 0x7F) << 1) | (part >> 7)).reshape(lv.shape)
+
+
+def _v1(lv):
+    """inverse of _v2"""
+    w = lv.reshape(*lv.shape[:-1], -1, 4)
+    part = w[..., [1, 0, 3, 2]]
+    return (((part & 1) << 7) | (w >> 1)).reshape(lv.shape)
+
+
+@torch.no_grad()
+def leaves_v1_to_v2(tree):
+    """a tree stored with leaf format 1 (statetree <= 0.3 checkpoints) -> leaf format 2 (states and nodes unchanged)"""
+    t = tree.clone()
+    t[..., :1024] = _v2(t[..., :1024].to(torch.int32)).to(torch.uint8)
+    return t
 
 
 def _encode_rows(W, perm):
@@ -27,7 +51,7 @@ def _encode_rows(W, perm):
     esc = D > 14
     Dq = torch.where(esc, torch.full_like(D, 15), D)[..., perm]
     SM = torch.where(esc, torch.zeros_like(D), ((s << 7) | m).view(M, NG, 64))[..., perm]
-    leaf = SM.reshape(T, 2, 8, NG, 4, 2, 2, 4).permute(0, 3, 5, 2, 4, 6, 1, 7).reshape(T, NG, 1024)
+    leaf = _v2(SM.reshape(T, 2, 8, NG, 4, 2, 2, 4).permute(0, 3, 5, 2, 4, 6, 1, 7).reshape(T, NG, 1024))
     Dv = Dq.reshape(T, 2, 8, NG, 4, 4, 4)
     nib = (Dv[:, 0] | (Dv[:, 1] << 4)).permute(0, 2, 1, 3, 4, 5).reshape(T, NG, 512)
     Ev = E.view(T, 2, 8, NG)
@@ -64,7 +88,7 @@ def decode_reference(tree, esc_rows, esc_cols, esc_bits):
     Tn, NG, _ = tree.shape
     M, N = Tn * 16, NG * 64
     rec = tree.to(torch.int32)
-    SMl = rec[..., :1024].reshape(Tn, NG, 2, 8, 4, 2, 2, 4).permute(0, 6, 3, 1, 4, 2, 5, 7).reshape(M, NG, 64)
+    SMl = _v1(rec[..., :1024]).reshape(Tn, NG, 2, 8, 4, 2, 2, 4).permute(0, 6, 3, 1, 4, 2, 5, 7).reshape(M, NG, 64)
     nib = rec[..., 1024:1536].reshape(Tn, NG, 8, 4, 4, 4)
     Dl = torch.stack([nib & 15, nib >> 4], 1).permute(0, 1, 3, 2, 4, 5, 6).reshape(M, NG, 64)
     E = rec[..., 1536:].reshape(Tn, NG, 8, 2).permute(0, 3, 2, 1).reshape(M, NG)

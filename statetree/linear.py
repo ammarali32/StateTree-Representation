@@ -3,7 +3,10 @@
 Forward paths (chosen per (shape, batch bucket), autotuned on first use or by 'statetree.prepare'):
   mv   batch <= 32     warp-per-tile matrix-vector kernel, decode in registers, split-K merged by the last CTA
   tm   batch 2..512    Marlin-style fused decode + mma.sync GEMM, stream-K over (row block, 64-col group) units
-  dec  any batch       decode to a BF16 scratch matrix, then cuBLAS (large batches / prefill)
+  tt   batch 65..1024  one-token-tile GEMM (prefill): 128 rows x TT tokens per tile, each 16 x 64 record decoded once
+                       per tile into shared memory; data-parallel rounds + stream-K, or balanced split-K (small layers)
+  dec  any batch       decode to a BF16 scratch matrix, then cuBLAS (large batches / prefill; the next layer's
+                       decode overlaps this layer's GEMM on a side stream)
 Outputs are computed from the exact BF16 weights; only the fp32 accumulation order differs from cuBLAS.
 """
 import contextlib
@@ -16,7 +19,7 @@ import torch
 import torch.nn as nn
 
 from . import format as F
-from .ops import ext
+from .ops import ext, tgx_ext
 
 __all__ = ["TreeLinear", "TreeSlice", "TreeEmbedding", "BUCKETS"]
 
@@ -24,9 +27,28 @@ __all__ = ["TreeLinear", "TreeSlice", "TreeEmbedding", "BUCKETS"]
 TM_CFGS = {0: (1, 2, 8, 1, 6, 1), 1: (1, 2, 8, 1, 4, 2), 2: (1, 4, 8, 1, 6, 1), 3: (1, 4, 8, 1, 4, 2),
            4: (1, 8, 8, 1, 6, 1), 5: (1, 8, 8, 1, 3, 2), 6: (1, 16, 8, 1, 4, 1), 7: (1, 16, 8, 1, 2, 2),
            8: (2, 8, 8, 1, 2, 2), 9: (1, 16, 4, 1, 2, 3), 10: (2, 8, 4, 1, 2, 3), 14: (1, 8, 4, 1, 2, 4)}
-BUCKETS = (1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512)
-BIG = 1 << 30                                       # batches above 512
-TUNE_VERSION = 2
+BUCKETS = (1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 160, 192, 224, 256, 320, 384, 512, 640, 768, 1024)
+BIG = 1 << 30                                       # batches above 1024: decode + cuBLAS with prefetch
+TUNE_VERSION = 4                  # 4: tt stream-K fix (small problems); plans tuned before it are re-tuned
+# tt: main-loop cycles per 64-k tile per CTA by (TT, NWT) (A100, whole chip busy): the cost model that ranks tile shapes
+TT_CYC = {(96, 2): 1350, (128, 2): 1630, (160, 2): 1880, (192, 2): 2250, (224, 2): 2640, (256, 2): 2945,
+          (128, 4): 1861, (192, 4): 2111, (256, 4): 2745}
+
+
+def tt_shapes(B, top=3):
+    """the 'top' (TT, NWT) of the tt cost model for B tokens: (# token tiles) x (cycles per k-tile)"""
+    return sorted(TT_CYC, key=lambda c: (-(-B // c[0]) * TT_CYC[c], -c[0]))[:top]
+
+
+def _tt_cfgs(M, B, sms):
+    if M % 128 or B <= 64:
+        return
+    for TT, NWT in tt_shapes(B):
+        NT = (M // 128) * -(-B // TT)
+        yield TT, NWT, 0                            # data-parallel rounds + stream-K
+        for s in (1, 2, 3, 4):                      # balanced split-K (s = 1: whole tiles): layers with few tiles
+            if NT * s <= 2 * sms:
+                yield TT, NWT, s
 
 
 @functools.lru_cache(None)
@@ -102,6 +124,7 @@ def candidates(M, N, B, st):
     if 2 <= B <= 512:
         for cfg in _tm_cfgs(M, B, st.smem_max):
             out += [("tm", (cfg, C)) for C in _grid_options(M, NG, B, cfg, st.sms)]
+    out += [("tt", c) for c in _tt_cfgs(M, B, st.sms)]
     if B > 32:
         out.append(("dec", None))
     return out
@@ -111,6 +134,8 @@ def heuristic(M, N, B, st):
     """Default plans (no tuning): a ranked list, the first valid one is used."""
     NG = N // 64
     out = []
+    if 64 < B and M % 128 == 0:                     # prefill batches: tt with the cost model's tile shape
+        out.append(("tt", (*tt_shapes(B, 1)[0], 0)))
     if B <= 8 or (B <= 32 and M < 1024):
         tiles = M // 16
         WK = next((w for w in (8, 4, 2, 1) if NG >= 2 * w), 1)
@@ -129,6 +154,110 @@ def heuristic(M, N, B, st):
         out.append(("mv", (1, 1, 1, 2)))
     out.append(("dec", None))
     return out
+
+
+# ----------------------------------------------------------------------------------------- large-batch prefetch
+_PF_OFF = [0]                                      # > 0 while tuning: no side-stream work
+
+
+def _prefetch_on():
+    return os.environ.get("STATETREE_PREFETCH", "1") != "0" and _PF_OFF[0] == 0
+
+
+def _no_prefetch(fn):
+    @functools.wraps(fn)
+    def w(*a, **k):
+        _PF_OFF[0] += 1
+        try:
+            return fn(*a, **k)
+        finally:
+            _PF_OFF[0] -= 1
+    return w
+
+
+class _Prefetch:
+    """decode + cuBLAS with prefetch: while layer i's GEMM runs, a low-priority side stream decodes the weight of the
+    layer expected next into the other of two BF16 buffers, so the decode overlaps the GEMM (its tail waves) instead
+    of adding to it. The order is learned from the first pass (the decode-path calls up to the first repeat); a wrong
+    guess only costs that decode. The buffers grow to the largest layer seen."""
+
+    def __init__(self, dev):
+        self.dev = dev
+        self.side = torch.cuda.Stream(device=dev, priority=torch.cuda.Stream.priority_range()[0])
+        self.buf, self.who, self.ready, self.free = [None, None], [None, None], [None, None], [None, None]
+        self.last = 1
+        self.seq, self.pos, self.closed = [], {}, False
+
+    def _buf(self, i, n):
+        b = self.buf[i]
+        if b is None or b.numel() < n:
+            for e in (self.ready[i], self.free[i]):
+                if e is not None:
+                    e.synchronize()                    # nothing in flight uses the old buffer when it is dropped
+            self.buf[i] = b = torch.empty(int(n), dtype=torch.bfloat16, device=self.dev)
+        return b
+
+    def _next(self, m):
+        k = id(m)
+        if not self.closed:
+            if k not in self.pos:
+                self.pos[k] = len(self.seq)
+                self.seq.append(weakref.ref(m))
+                return None
+            self.closed = len(self.seq) > 1
+            if not self.closed:
+                return None
+        i = self.pos.get(k)
+        if i is None:
+            return None
+        n = self.seq[(i + 1) % len(self.seq)]()
+        return n if n is not None and n.allow_dec and n.tree.device == m.tree.device else None
+
+    @staticmethod
+    def _key(m):
+        return id(m), m.tree.data_ptr(), m.tree._version
+
+    def run(self, m, x, y):
+        M, N = m.out_features, m.in_features
+        cur = torch.cuda.current_stream(self.dev)
+        k = self._key(m)
+        if k in self.who:
+            b = self.who.index(k)
+            cur.wait_event(self.ready[b])
+        else:
+            b = 1 - self.last
+            buf = self._buf(b, M * N)
+            if self.ready[b] is not None:
+                cur.wait_event(self.ready[b])          # a prefetch into b may still be running
+            eo, el = m._esc_lists()
+            ext().dec(m.tree, eo, el, buf[:M * N].view(M, N))
+            self.who[b] = k
+            self.ready[b] = torch.cuda.Event()
+            self.ready[b].record(cur)
+        n = self._next(m)
+        o = 1 - b
+        if n is not None and self.who[o] != self._key(n):
+            n_eo, n_el = n._esc_lists()                # side tables are built on this stream, before the GEMM
+            go = torch.cuda.Event()
+            go.record(cur)
+        else:
+            n = None
+        torch.matmul(x, self.buf[b][:M * N].view(M, N).t(), out=y)
+        self.free[b] = torch.cuda.Event()
+        self.free[b].record(cur)
+        self.last = b
+        if n is not None:
+            Mn, Nn = n.out_features, n.in_features
+            buf = self._buf(o, Mn * Nn)
+            s = self.side
+            s.wait_event(go)
+            if self.free[o] is not None:
+                s.wait_event(self.free[o])             # the GEMM that last read buffer o
+            with torch.cuda.stream(s):
+                ext().dec(n.tree, n_eo, n_el, buf[:Mn * Nn].view(Mn, Nn))
+            self.ready[o] = torch.cuda.Event()
+            self.ready[o].record(s)
+            self.who[o] = self._key(n)
 
 
 # ----------------------------------------------------------------------------------------- per-device state
@@ -151,11 +280,50 @@ class _DevState:
             self.ws = torch.empty(int(n), dtype=torch.float32, device=self.dev)
         return self.ws
 
+    def get_tgx(self, M, N):
+        """ring buffer (R strips of 128 x N BF16, about <= 64 MB) and counters of the large-batch kernel"""
+        NS = M // 128
+        R = max(2, min(NS, 48, (64 << 20) // (256 * N)))
+        if getattr(self, "tgx_ring", None) is None or self.tgx_ring.numel() < R * 128 * N:
+            if getattr(self, "tgx_ring", None) is not None:
+                self._keep.append(self.tgx_ring)
+            self.tgx_ring = torch.empty(R * 128 * N, dtype=torch.bfloat16, device=self.dev)
+        if getattr(self, "tgx_cnt", None) is None or self.tgx_cnt.numel() < 2 * NS + 1:
+            self.tgx_cnt = torch.zeros(2 * NS + 1, dtype=torch.int32, device=self.dev)
+        return self.tgx_ring[:R * 128 * N], self.tgx_cnt
+
+    def prefetcher(self):
+        if getattr(self, "pf", None) is None:
+            self.pf = _Prefetch(self.dev)
+        return self.pf
+
+    def get_tt_ws(self):
+        """tt: partial accumulators of split tiles (2 G slots of 128 x 256 fp32) and their counters (zero between
+        launches: the last arriving piece resets its counter)"""
+        if getattr(self, "tt_ws", None) is None:
+            self.tt_ws = torch.empty(self.sms * 2 * 256 * 128, dtype=torch.float32, device=self.dev)
+            self.tt_cnt = torch.zeros(4 * self.sms, dtype=torch.int32, device=self.dev)
+        return self.tt_ws, self.tt_cnt
+
     def get_scratch(self, n):
         if self.scratch.numel() < n:
             self._keep.append(self.scratch)
             self.scratch = torch.empty(int(n), dtype=torch.bfloat16, device=self.dev)
         return self.scratch
+
+    def snapshot(self):
+        """the growable buffers, taken before an autotuning run"""
+        return dict(ws=self.ws, scratch=self.scratch, keep=len(self._keep), flush=self._flush,
+                    tgx=getattr(self, "tgx_ring", None))
+
+    def restore(self, snap):
+        """drop what an autotuning run grew: losing candidates would otherwise pin their workspaces and decode
+        scratch matrices for the life of the process (3.6 GiB on Qwen3-8B, taken from vLLM's KV cache). The winning
+        plans grow them again on first use; buffers that existed before tuning stay (a captured CUDA graph may use them)."""
+        self.ws, self.scratch, self._flush = snap["ws"], snap["scratch"], snap["flush"]
+        if snap["tgx"] is not None or getattr(self, "tgx_ring", None) is not None:
+            self.tgx_ring = snap["tgx"]
+        del self._keep[snap["keep"]:]
 
     def flush(self):
         if self._flush is None:
@@ -184,11 +352,11 @@ def _cache_path():
     return None if p in ("0", "") else p
 
 
-def _tkey(st, M, N, bk):
-    return f"v{TUNE_VERSION}|{st.name}|{M}|{N}|{bk}"
+def _tkey(st, M, N, bk, tag=""):
+    return f"v{TUNE_VERSION}{tag}|{st.name}|{M}|{N}|{bk}"
 
 
-def _tuned_get(st, M, N, bk):
+def _tuned_get(st, M, N, bk, tag=""):
     global _TUNED_LOADED
     if not _TUNED_LOADED:
         _TUNED_LOADED = True
@@ -199,12 +367,12 @@ def _tuned_get(st, M, N, bk):
                     _TUNED.update(json.load(fh))
             except (OSError, ValueError):
                 pass
-    r = _TUNED.get(_tkey(st, M, N, bk))
+    r = _TUNED.get(_tkey(st, M, N, bk, tag))
     return None if r is None else [(path, tuple(prm) if prm is not None else None) for path, prm in r]
 
 
-def _tuned_put(st, M, N, bk, ranked):
-    _TUNED[_tkey(st, M, N, bk)] = [[p, list(q) if q is not None else None] for p, q in ranked]
+def _tuned_put(st, M, N, bk, ranked, tag=""):
+    _TUNED[_tkey(st, M, N, bk, tag)] = [[p, list(q) if q is not None else None] for p, q in ranked]
     p = _cache_path()
     if p:
         try:
@@ -246,6 +414,8 @@ class TreeLinear(nn.Module):
 
     Buffers (saved in the state dict): tree [out/16, in/64, 1552] uint8, esc_rows / esc_cols int32 and esc_bits int16
     (exact bits of the ~0.01% weights the tree cannot hold), bias (optional, bf16)."""
+
+    TUNE_TAG = ""                                   # tuning-table key suffix (subclasses running other kernels)
 
     def __init__(self, in_features, out_features, bias=False, device=None, n_esc=0):
         super().__init__()
@@ -345,8 +515,45 @@ class TreeLinear(nn.Module):
                                           self.esc_bits)
         return self._rt[k]
 
+    def _tt_tables(self):
+        """tt escape tables, per 128-row block rb: koff[rb, kt] = start of k-tile kt's escapes (KS ints per row) and
+        ent[rb, :CAP] = bf16 bits << 16 | record << 10 | row << 6 | col, sorted by k-tile"""
+        k = (self.tree.device, "tt")
+        if k not in self._rt:
+            M, N = self.out_features, self.in_features
+            dev = self.tree.device
+            er, ec = self.esc_rows.long(), self.esc_cols.long()
+            eb = self.esc_bits.long() & 0xFFFF
+            NG, nrb = N // 64, M // 128
+            KS = (NG + 1 + 3) // 4 * 4
+            rb, kt = er // 128, ec // 64
+            key = rb * NG + kt
+            cnt = (torch.bincount(key, minlength=nrb * NG).view(nrb, NG) if er.numel()
+                   else torch.zeros(nrb, NG, dtype=torch.long, device=dev))
+            per = cnt.sum(1)
+            CAP = max(4, (int(per.max().item()) + 3) // 4 * 4)
+            koff = torch.zeros(nrb, KS, dtype=torch.long, device=dev)
+            koff[:, 1:NG + 1] = cnt.cumsum(1)
+            koff[:, NG + 1:] = koff[:, NG:NG + 1]
+            ent = torch.zeros(nrb, CAP, dtype=torch.long, device=dev)
+            if er.numel():
+                order = torch.argsort(key, stable=True)
+                er_, ec_, eb_, rb_ = er[order], ec[order], eb[order], rb[order]
+                start = torch.zeros(nrb + 1, dtype=torch.long, device=dev)
+                start[1:] = per.cumsum(0)
+                pos = torch.arange(er_.numel(), device=dev) - start[rb_]
+                ent[rb_, pos] = (eb_ << 16) | (((er_ % 128) // 16) << 10) | ((er_ % 16) << 6) | (ec_ % 64)
+            self._rt[k] = (F._i32(koff.view(-1)), F._i32(ent.view(-1)), KS, CAP)
+        return self._rt[k]
+
     def _valid(self, path, prm, B):
         M, N = self.out_features, self.in_features
+        if path == "tt":
+            st = _state(self.tree.device)
+            if M % 128 or B <= 0 or (M // 128) * -(-B // prm[0]) * prm[2] > 2 * st.sms:
+                return False
+            self._tt_tables()                       # build the side tables now (not inside a CUDA-graph capture)
+            return True
         if path == "mv":
             return B <= 32 and M % (16 * prm[0]) == 0
         if path == "tm":
@@ -402,9 +609,14 @@ class TreeLinear(nn.Module):
     def _resolve(self, bk):
         M, N = self.out_features, self.in_features
         st = _state(self.tree.device)
-        if bk == BIG:                           # a vocab-sized table never decodes to an M x N scratch matrix:
-            return ("dec", None) if self.allow_dec else ("chunk", None)     # it runs in 512-row slices instead
-        ranked = _tuned_get(st, M, N, bk)
+        if bk == BIG:
+            # large batches (prefill): CUTLASS GEMM with a concurrent decode kernel, no M x N scratch matrix
+            if M % 128 == 0 and N % 64 == 0 and tgx_ext() is not None:
+                return ("tgx", None)
+            # otherwise decode + cuBLAS; a vocab-sized table never decodes to an M x N scratch matrix, it runs in
+            # 512-row slices instead
+            return ("dec", None) if self.allow_dec else ("chunk", None)
+        ranked = _tuned_get(st, M, N, bk, self.TUNE_TAG)
         if ranked is None and _autotune_on() and not _capturing():
             ranked = self.tune(bk)
         for path, prm in (ranked or []) + heuristic(M, N, bk, st):
@@ -436,7 +648,19 @@ class TreeLinear(nn.Module):
             nbb = -(-B // gm["BB"])
             ws = st.get_ws(nbb * (M // (16 * gm["RT"])) * P * gm["PE"])
             E.tm(self.tree, eb, eou, eall, x, y, ws, st.cnt, cfg, C, P, 1 if nbb == 1 else 0, 0)
+        elif path == "tt":
+            TT, NWT, sp = prm
+            koff, ent, KS, CAP = self._tt_tables()
+            ws, cnt = st.get_tt_ws()
+            E.tt(TT, NWT, sp, x, self.tree, koff, ent, y, ws, cnt, KS, CAP)
+        elif path == "tgx":
+            eo, el = self._esc_lists()
+            ring, cnt = st.get_tgx(M, N)
+            tgx_ext().tgx(self.tree, eo, el, x, y, ring, cnt, 0)
         else:
+            if _prefetch_on() and not _capturing():
+                st.prefetcher().run(self, x, y)
+                return
             eo, el = self._esc_lists()
             W = st.get_scratch(M * N)[:M * N].view(M, N)
             E.dec(self.tree, eo, el, W)
@@ -469,8 +693,18 @@ class TreeLinear(nn.Module):
         return y if src == dev else y.to(src)
 
     # ---------------------------------------------------------------- tuning
+    @_no_prefetch
     @torch.no_grad()
     def tune(self, bk, iters=12, verbose=False, group=None):
+        """Autotune batch bucket bk (see _tune); the buffers the candidates grow are released afterwards."""
+        st = _state(self.tree.device)
+        snap = st.snapshot()
+        try:
+            return self._tune(bk, iters, verbose, group)
+        finally:
+            st.restore(snap)
+
+    def _tune(self, bk, iters=12, verbose=False, group=None):
         """Time every candidate path for batch bucket bk and store the ranking for this shape. With group (layers of
         the same shape, e.g. one per transformer block) each timing runs the whole group back to back after an L2
         flush, as the layers run in a model; otherwise this layer alone after an L2 flush."""
@@ -514,7 +748,7 @@ class TreeLinear(nn.Module):
         ranked = [p for _, p in res[:4]]
         if verbose and res:
             print(f"statetree tune {M}x{N} b{bk}: " + ", ".join(f"{p[0]}{p[1]} {t * 1e3:.1f}us" for t, p in res[:3]))
-        _tuned_put(st, M, N, bk, ranked)
+        _tuned_put(st, M, N, bk, ranked, self.TUNE_TAG)
         return ranked
 
     def prepare(self, batch_sizes=(1,)):

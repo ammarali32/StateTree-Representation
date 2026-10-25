@@ -8,15 +8,21 @@ if os.environ.get("STATETREE_NO_EXT", "0") != "1":
     from torch.utils.cpp_extension import BuildExtension, CUDAExtension
     if "TORCH_CUDA_ARCH_LIST" not in os.environ and not torch.cuda.is_available():
         os.environ["TORCH_CUDA_ARCH_LIST"] = "8.0;8.6;8.9;9.0+PTX"         # the kernels need sm_80+ (cp.async, bf16 mma)
-    ext_modules = [CUDAExtension(
-        "statetree._C", ["statetree/csrc/kernels.cu", "statetree/csrc/bindings.cpp"],
-        extra_compile_args={"cxx": ["-O3"], "nvcc": ["-O3"]})]
+    flags = {"cxx": ["-O3", "-std=c++17"], "nvcc": ["-O3", "-std=c++17"]}
+    ext_modules = [
+        CUDAExtension("statetree._C",                                        # weight kernels (mv, tm, tt, dec, rows)
+                      ["statetree/csrc/kernels.cu", "statetree/csrc/tt.cu", "statetree/csrc/bindings.cpp"],
+                      extra_compile_args=flags),
+        CUDAExtension("statetree._kv", ["statetree/csrc/kvcache.cu"],      # KV-cache pages + decode attention
+                      extra_compile_args=flags),
+    ]
     cmdclass = {"build_ext": BuildExtension}
 
 setup(
     name="statetree",
-    version="0.3.0",
-    description="Lossless state-tree BF16 weights (12.1 bits/weight) with fused CUDA GEMV/GEMM kernels for PyTorch",
+    version="0.4.0",
+    description="Lossless state-tree BF16 weights (12.1 bits/weight) and KV cache (12.5 bits/value) with fused CUDA "
+                "kernels for PyTorch, Hugging Face Transformers and vLLM",
     long_description=open("README.md").read() if os.path.exists("README.md") else "",
     long_description_content_type="text/markdown",
     author="Ammar Ali",

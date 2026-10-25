@@ -11,7 +11,7 @@ import torch.nn as nn
 from .linear import TreeEmbedding, TreeLinear, TreeSlice
 
 FORMAT_NAME = "statetree"
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3                                  # 3: leaf format v2 (format.LEAF_FORMAT); 2 is migrated on load
 WEIGHTS_NAME = "model.safetensors"
 INFO_NAME = "statetree.json"
 # sibling Linears that read the same input: attention and MLP of Llama / Mistral / Qwen / Gemma blocks, and the input
@@ -354,6 +354,12 @@ def load_pretrained(path, device=None, device_map="auto", max_memory=None, model
             if len(gpus) <= 1 and "cpu" not in dmap.values():          # one GPU, nothing offloaded: no hooks needed
                 device, dmap = _torch_device(next(iter(gpus), 0)), None
     sd = load_file(os.path.join(path, WEIGHTS_NAME), device=str(device) if dmap is None else "cpu")
+    if info.get("version", 2) < 3:                  # statetree <= 0.3 checkpoint: leaf format 1 -> 2
+        from .format import RECORD_BYTES, leaves_v1_to_v2
+        for k in list(sd):
+            v = sd[k]
+            if k.endswith("tree") and v.dtype == torch.uint8 and v.dim() == 3 and v.shape[-1] == RECORD_BYTES:
+                sd[k] = leaves_v1_to_v2(v)
     for alias, src in info.get("aliases", {}).items():
         sd[alias] = sd[src]
     if dmap is not None:

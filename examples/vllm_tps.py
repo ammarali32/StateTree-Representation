@@ -172,6 +172,8 @@ def main():
     ap.add_argument("--max-len", type=int, default=4096)
     ap.add_argument("--eager", action="store_true", help="disable CUDA graphs / torch.compile")
     ap.add_argument("--tp", type=int, default=1, help="tensor-parallel GPUs")
+    ap.add_argument("--reps", default="bf16,statetree", help="representations to run (bf16 first), e.g. "
+                    "bf16,dense16,statetree: dense16 runs the statetree kernels on BF16 (ablation control)")
     ap.add_argument("--pp", type=int, default=1, help="pipeline-parallel stages")
     ap.add_argument("--layer-bench", action="store_true", help="also time every tree-layer shape vs BF16 F.linear "
                                                                    "inside the statetree engine (needs a BF16 copy)")
@@ -186,9 +188,18 @@ def main():
                 gpu_mem=args.gpu_mem, max_len=args.max_len, eager=args.eager, layer_bench=args.layer_bench,
                 tp=args.tp, pp=args.pp)
     res = dict(model=args.model)
-    for tag in ("bf16", "statetree"):
+    for tag in args.reps.split(","):
         res[tag] = run_engine(dict(base, representation=tag), log=os.path.splitext(args.out)[0] + f"_{tag}.log")
         print(tag, {k: v for k, v in res[tag].items() if k not in ("tf_top1", "gen", "layer_bench")}, flush=True)
+    if "dense16" in res:                                    # kernel (dense16 / bf16) and format (statetree / dense16)
+        d, z = res["dense16"], res["bf16"]
+        res["dense16_tf_top1_agree"] = top1_agree(z["tf_top1"], d["tf_top1"])
+        for B in base["batches"]:
+            res[f"kernel_dense16_vs_bf16_b{B}"] = round(d[f"decode_b{B}_tps"] / z[f"decode_b{B}_tps"], 3)
+            if "statetree" in res:
+                res[f"format_statetree_vs_dense16_b{B}"] = round(
+                    res["statetree"][f"decode_b{B}_tps"] / d[f"decode_b{B}_tps"], 3)
+        d.pop("tf_top1", None)
     a, b = res["bf16"], res["statetree"]
     res["tf_top1_agree"] = top1_agree(a["tf_top1"], b["tf_top1"])
     res["gen_first_token_equal"] = sum(int(x[0] == y[0]) for x, y in zip(a["gen"], b["gen"]))

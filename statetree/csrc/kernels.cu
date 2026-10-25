@@ -39,13 +39,14 @@ __device__ __forceinline__ void mma16816(float* c, const uint32_t* a, uint32_t b
 __device__ __forceinline__ uint32_t wsel(const uint4& v, int s) {
   return s == 0 ? v.x : (s == 1 ? v.y : (s == 2 ? v.z : v.w));
 }
-// 4 weights: leaf bytes, states (bytes 0..15), node exponent * 0x01010101 -> bf16 pairs (w0,w1), (w2,w3)
-__device__ __forceinline__ void dec4(uint32_t sm, uint32_t d, uint32_t E4, uint32_t& p01, uint32_t& p23) {
+// 4 weights: leaf bytes (format v2: m << 1 | sign of the pair partner), states (bytes 0..15), node exponent *
+// 0x01010101 -> bf16 pairs (w0,w1), (w2,w3): bytes [leaf0, exp0, leaf1, exp1] rotated right by one bit put w1's sign
+// (leaf0 bit 0) on bit 31 and w0's sign (leaf1 bit 0) on bit 15
+__device__ __forceinline__ void dec4(uint32_t lf, uint32_t d, uint32_t E4, uint32_t& p01, uint32_t& p23) {
   const uint32_t e4 = E4 - d;
-  const uint32_t hi = (sm & 0x80808080u) | ((e4 >> 1) & 0x7F7F7F7Fu);
-  const uint32_t lo = ((e4 << 7) & 0x80808080u) | (sm & 0x7F7F7F7Fu);
-  p01 = __byte_perm(lo, hi, 0x5140);
-  p23 = __byte_perm(lo, hi, 0x7362);
+  const uint32_t a = __byte_perm(lf, e4, 0x5140), b = __byte_perm(lf, e4, 0x7362);
+  p01 = __funnelshift_r(a, a, 1);
+  p23 = __funnelshift_r(b, b, 1);
 }
 // A fragment (a0..a3) of k-step s from a lane's record chunks c0, c1 (leaves) and c2 (states)
 __device__ __forceinline__ void dec_step5(const uint4& c0, const uint4& c1, const uint4& c2, uint32_t E0, uint32_t E1,
@@ -603,4 +604,121 @@ void tm(torch::Tensor T, torch::Tensor EB, torch::Tensor EOU, torch::Tensor EALL
     case 14: launch_tm<1, 8, 4, 1, 2, 4>(a, c, st); break;
     default: TORCH_CHECK(false, "tm: bad cfg");
   }
+}
+
+// ---------------------------------------------------------------------------------------------- dense16 (ablation)
+// Control for the format: the mv kernel above, reading plain BF16 instead of tree records. Per (16-row tile, 64-column
+// group) one 2048-byte block in mma-fragment order: k-step s, lane l -> uint4 {a0, a1, a2, a3} at byte s * 512 + l * 16.
+// Same tiling, split-K, prefetch depth and reduction as mv7; no decode, no escapes. statetree vs dense16 isolates the
+// format (bytes read), dense16 vs cuBLAS isolates the kernel.
+struct AD {
+  const uint8_t* T; const uint16_t* X; __nv_bfloat16* Y; float* WS; int* CNT;
+  int M, N, B, WM, WK;
+};
+
+template <int NT>
+struct FD { uint4 c[4]; uint32_t x[NT][8]; };
+
+template <int NT>
+__device__ __forceinline__ void load_fd(FD<NT>& f, const AD& a, int tile, int G, int lane, int NG) {
+  const int g = lane >> 2, t = lane & 3;
+  const uint8_t* base = a.T + ((size_t)tile * NG + G) * 2048 + lane * 16;
+#pragma unroll
+  for (int s = 0; s < 4; ++s) f.c[s] = ldw(base + s * 512);
+#pragma unroll
+  for (int nt = 0; nt < NT; ++nt) {
+    const int n = nt * 8 + g;
+    if (n < a.B) {
+      const uint32_t* xp = (const uint32_t*)(a.X + (size_t)n * a.N + G * 64 + 2 * t);
+#pragma unroll
+      for (int s = 0; s < 4; ++s) { f.x[nt][2 * s] = __ldg(xp + 8 * s); f.x[nt][2 * s + 1] = __ldg(xp + 8 * s + 4); }
+    } else {
+#pragma unroll
+      for (int q = 0; q < 8; ++q) f.x[nt][q] = 0u;
+    }
+  }
+}
+
+template <int NT, int PF>
+__global__ void __launch_bounds__(256) mvd_kernel(AD a) {
+  extern __shared__ float smem[];
+  const int NG = a.N / 64;
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int g = lane >> 2, t = lane & 3;
+  const int wm = warp % a.WM, wk = warp / a.WM;
+  const int tile = blockIdx.x * a.WM + wm;
+  const int GY = gridDim.y;
+  const int cg0 = NG * blockIdx.y / GY, cg1 = NG * (blockIdx.y + 1) / GY;
+  const int G0 = cg0 + (cg1 - cg0) * wk / a.WK, G1 = cg0 + (cg1 - cg0) * (wk + 1) / a.WK;
+  float c[NT][4];
+#pragma unroll
+  for (int nt = 0; nt < NT; ++nt) c[nt][0] = c[nt][1] = c[nt][2] = c[nt][3] = 0.f;
+  FD<NT> f[PF];
+#pragma unroll
+  for (int i = 0; i < PF; ++i)
+    if (G0 + i < G1) load_fd<NT>(f[i], a, tile, G0 + i, lane, NG);
+  for (int G = G0; G < G1; G += PF) {
+#pragma unroll
+    for (int i = 0; i < PF; ++i) {
+      if (G + i < G1) {
+#pragma unroll
+        for (int s = 0; s < 4; ++s) {
+          const uint32_t A[4] = {f[i].c[s].x, f[i].c[s].y, f[i].c[s].z, f[i].c[s].w};
+#pragma unroll
+          for (int nt = 0; nt < NT; ++nt) mma16816(c[nt], A, f[i].x[nt][2 * s], f[i].x[nt][2 * s + 1]);
+        }
+        if (G + i + PF < G1) load_fd<NT>(f[i], a, tile, G + i + PF, lane, NG);
+      }
+    }
+  }
+  const int R = a.WM * 16, NBC = NT * 8, EL = R * NBC;
+  float* red = smem;
+  float* out = smem + a.WK * EL;
+#pragma unroll
+  for (int nt = 0; nt < NT; ++nt) {
+    const int rr = wm * 16 + g, n = nt * 8 + 2 * t;
+    red[wk * EL + n * R + rr] = c[nt][0];
+    red[wk * EL + (n + 1) * R + rr] = c[nt][1];
+    red[wk * EL + n * R + rr + 8] = c[nt][2];
+    red[wk * EL + (n + 1) * R + rr + 8] = c[nt][3];
+  }
+  __syncthreads();
+  for (int idx = threadIdx.x; idx < EL; idx += blockDim.x) {
+    float s = 0.f;
+    for (int k = 0; k < a.WK; ++k) s += red[k * EL + idx];
+    out[idx] = s;
+  }
+  __syncthreads();
+  A7 m;
+  m.WS = a.WS; m.CNT = a.CNT;
+  if (GY > 1 && !merge7(m, out, EL, blockIdx.x, blockIdx.y, GY)) return;
+  for (int idx = threadIdx.x; idx < EL; idx += blockDim.x) {
+    const int n = idx / R, r = idx % R;
+    if (n < a.B) a.Y[(size_t)n * a.M + (size_t)blockIdx.x * R + r] = __float2bfloat16_rn(out[idx]);
+  }
+}
+
+template <int NT, int PF>
+void launch_mvd(const AD& a, int GY, cudaStream_t st) {
+  dim3 grid(a.M / (16 * a.WM), GY);
+  const size_t sm = (size_t)(a.WK + 1) * a.WM * 16 * NT * 8 * sizeof(float);
+  mvd_kernel<NT, PF><<<grid, 32 * a.WM * a.WK, sm, st>>>(a);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void mvd(torch::Tensor T, torch::Tensor X, torch::Tensor Y, torch::Tensor WS, torch::Tensor CNT, int64_t WM,
+         int64_t WK, int64_t GY, int64_t PF) {
+  const c10::cuda::OptionalCUDAGuard guard(T.device());
+  AD a;
+  a.T = T.data_ptr<uint8_t>();
+  a.X = (const uint16_t*)X.data_ptr<at::BFloat16>(); a.Y = (__nv_bfloat16*)Y.data_ptr<at::BFloat16>();
+  a.WS = WS.data_ptr<float>(); a.CNT = CNT.data_ptr<int>();
+  a.M = Y.size(1); a.N = X.size(1); a.B = X.size(0); a.WM = WM; a.WK = WK;
+  TORCH_CHECK(a.B >= 1 && a.B <= 32 && a.M % (16 * a.WM) == 0 && a.N % 64 == 0 && a.WM * a.WK <= 8, "mvd config");
+  TORCH_CHECK(T.numel() == (int64_t)a.M * a.N * 2, "mvd: weight blocks do not match the shapes");
+  cudaStream_t st = at::cuda::getCurrentCUDAStream();
+  const int G = (int)GY;
+  if (a.B <= 8) { if (PF == 4) launch_mvd<1, 4>(a, G, st); else launch_mvd<1, 2>(a, G, st); }
+  else if (a.B <= 16) { if (PF == 4) launch_mvd<2, 4>(a, G, st); else launch_mvd<2, 2>(a, G, st); }
+  else { if (PF == 4) launch_mvd<4, 4>(a, G, st); else launch_mvd<4, 2>(a, G, st); }
 }
