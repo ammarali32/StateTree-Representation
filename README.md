@@ -410,14 +410,14 @@ help.
 
 ## Citation
 
-statetree implements one application of our weight-representation paper (soon):
+statetree implements one application of our weight-representation <a href="https://arxiv.org/abs/2610.31931">paper</a>:
 
 ```bibtex
-@article{ali2026twig,
+@article{ali2026every,
   title   = {Every Weight Is a Path of Shared Discrete Decisions},
-  author  = {Ali, Ammar and Lefkimmiatis, Stamatis},
-  journal = {arXiv preprint},
-  year    = {2026}
+  author  = {Ammar Ali and Stamatis Lefkimmiatis},
+  year    = {2026},
+  journal = {arXiv preprint arXiv: 2610.31931}
 }
 ```
 
