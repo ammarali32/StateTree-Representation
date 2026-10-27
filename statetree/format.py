@@ -71,15 +71,30 @@ def encode(W, chunk_rows=4096):
     assert M % 16 == 0 and N % 64 == 0, f"shape {tuple(W.shape)}: rows must be a multiple of 16, cols of 64"
     perm = torch.tensor(PERM, device=W.device)
     chunk_rows = max(16, chunk_rows // 16 * 16)
-    recs, rows, cols, bits = [], [], [], []
+    tree = torch.empty(M // 16, N // 64, RECORD_BYTES, dtype=torch.uint8, device=W.device)   # filled in place: no
+    rows, cols, bits = [], [], []                                                          # second copy of the tree
     for r0 in range(0, M, chunk_rows):
         rec, er, ec, eb = _encode_rows(W[r0:r0 + chunk_rows], perm)
-        recs.append(rec)
+        tree[r0 // 16:r0 // 16 + rec.shape[0]] = rec
+        del rec
         rows.append((er + r0).to(torch.int32))
         cols.append(ec.to(torch.int32))
         bits.append(eb)
-    return dict(tree=torch.cat(recs).contiguous(), esc_rows=torch.cat(rows), esc_cols=torch.cat(cols),
-                esc_bits=torch.cat(bits))
+    return dict(tree=tree, esc_rows=torch.cat(rows), esc_cols=torch.cat(cols), esc_bits=torch.cat(bits))
+
+
+@torch.no_grad()
+def escape_count(W, chunk_rows=8192):
+    """number of weights of W [M, N] (or [..., M, N], a stack of matrices) that the tree cannot hold (exponent more
+    than 14 below the largest of its 64-group): the escapes encode() would list. Chunked: a few MB of scratch."""
+    assert W.dtype == torch.bfloat16 and W.shape[-1] % 64 == 0
+    W2 = W.reshape(-1, W.shape[-1])
+    n = 0
+    for r0 in range(0, W2.shape[0], chunk_rows):
+        b = W2[r0:r0 + chunk_rows].contiguous().view(torch.int16).to(torch.int32)
+        e = ((b >> 7) & 0xFF).view(b.shape[0], -1, 64)
+        n += int(((e.amax(-1, keepdim=True) - e) > 14).sum())
+    return n
 
 
 @torch.no_grad()

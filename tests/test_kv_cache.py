@@ -1,6 +1,7 @@
 """State-tree KV cache tests (CUDA, sm_80+): the page kernels bit for bit (append over recycled pages, as vLLM reuses
 blocks; gathered page decode), decode attention against an fp32 reference, and the Hugging Face cache
-(StateTreeKVCache + the 'statetree' attention) against DynamicCache + SDPA on a small random Qwen3 model.
+(StateTreeKVCache + the 'statetree' attention) against DynamicCache + SDPA on a small random Qwen3 model, and CUDA-graph
+decode (statetree.bench.StaticGraphDecoder) with StaticCache and StateTreeKVCache against eager steps.
     python -m pytest tests/test_kv_cache.py -q   or   python tests/test_kv_cache.py"""
 import math
 
@@ -164,6 +165,120 @@ def test_hf_cache_matches_sdpa():
     assert rel < 2e-2, rel
     assert (got.argmax(-1) == ref.argmax(-1)).float().mean().item() >= 0.9
 
+
+
+def test_hf_graph_decode():
+    """statetree.bench.StaticGraphDecoder (one greedy decode step in a CUDA graph) with transformers' StaticCache and
+    with StateTreeKVCache: graph replays give the same tokens as eager steps, also when replaying straight after
+    capture(), and each cache's GPU-side token count ends at prompt + steps (Transformers >= 5.20 take positions from
+    it)"""
+    try:
+        from transformers import Qwen3Config, Qwen3ForCausalLM
+    except ImportError:
+        print("skip (transformers with Qwen3 not installed)")
+        return
+    from statetree import bench
+    from statetree.kvcache import StateTreeKVCache, enable
+
+    class TreeKV(bench.StaticGraphDecoder):
+        def __init__(self, model, batch, max_len, graph=True):
+            super().__init__(model, batch, max_len, graph)
+            self.cache = StateTreeKVCache(model.config, batch_size=batch, max_cache_len=max_len)
+
+    torch.manual_seed(0)
+    cfg = Qwen3Config(vocab_size=1024, hidden_size=1024, intermediate_size=2048, num_hidden_layers=2,
+                      num_attention_heads=16, num_key_value_heads=4, head_dim=128, max_position_embeddings=4096)
+    m = Qwen3ForCausalLM(cfg).to(DEV, torch.bfloat16).eval()
+    with torch.no_grad():
+        for p in m.parameters():
+            if p.dim() >= 2:
+                p.normal_(0, 0.05)                                                # varied greedy tokens
+    B, P, N = 2, 64, 24
+    ids = torch.randint(0, 1024, (B, P), device=DEV, generator=torch.Generator(device=DEV).manual_seed(1))
+    for cls, attn in ((bench.StaticGraphDecoder, "sdpa"), (TreeKV, "statetree")):
+        if attn == "sdpa":
+            m.set_attn_implementation("sdpa")
+        else:
+            enable(m)
+        eager, _ = cls(m, B, P + N + 8, graph=False).generate(ids, N)
+        r = cls(m, B, P + N + 8, graph=True)
+        first = r.prefill(ids)
+        r.capture()
+        for _ in range(N - 1):                                                    # straight after capture
+            r.graph.replay()
+        torch.cuda.synchronize()
+        direct = torch.cat([first, r.out[:, :N - 1]], 1)
+        again, _ = r.generate(ids, N)                                             # prefill again, then replays
+        assert torch.equal(direct, eager), (attn, direct, eager)
+        assert torch.equal(again, eager), (attn, again, eager)
+        lay = r.cache.layers[0]
+        count = getattr(lay, "cum", None) if attn == "statetree" else getattr(lay, "cumulative_length", None)
+        if isinstance(count, torch.Tensor):
+            assert int(count) == P + N - 1, (attn, int(count))
+        if attn == "statetree":
+            assert r.cache.lens[:B].tolist() == [P + N - 1] * B
+            r.cache.check()
+        assert len(set(eager.flatten().tolist())) > 4, "degenerate greedy output: the test would not see errors"
+        del r
+
+
+def test_hf_generate():
+    """model.generate with a StateTreeKVCache (as in the README), batch 2 with one left-padded row, against
+    transformers' default cache + SDPA: generate runs and starts with the same tokens; then, teacher-forced on the
+    reference tokens (positions as generate computes them), every step's logits of both rows are within the SDPA
+    tolerance and the padded row's first valid position is taken from the mask. (Free-running greedy outputs drift
+    apart after the first near-tie, so they are not compared token for token.)"""
+    try:
+        from transformers import DynamicCache, Qwen3Config, Qwen3ForCausalLM
+    except ImportError:
+        print("skip (transformers with Qwen3 not installed)")
+        return
+    from statetree.kvcache import StateTreeKVCache, enable
+    torch.manual_seed(0)
+    cfg = Qwen3Config(vocab_size=1024, hidden_size=1024, intermediate_size=2048, num_hidden_layers=2,
+                      num_attention_heads=16, num_key_value_heads=4, head_dim=128, max_position_embeddings=4096,
+                      pad_token_id=0, eos_token_id=None, bos_token_id=None)
+    m = Qwen3ForCausalLM(cfg).to(DEV, torch.bfloat16).eval()
+    with torch.no_grad():
+        for p in m.parameters():
+            if p.dim() >= 2:
+                p.normal_(0, 0.05)
+    P, PAD, N = 48, 8, 16
+    ids = torch.randint(1, 1024, (2, P), device=DEV, generator=torch.Generator(device=DEV).manual_seed(2))
+    mask = torch.ones_like(ids)
+    ids[1, :PAD], mask[1, :PAD] = 0, 0                                            # row 1: left padding
+
+    @torch.no_grad()
+    def forced(cache, toks):
+        am, pos = mask.clone(), (mask.cumsum(-1) - 1).clamp(min=0)
+        out = m(input_ids=ids, attention_mask=am, position_ids=pos, past_key_values=cache, use_cache=True)
+        logs = [out.logits[:, -1].float()]
+        for i in range(N - 1):
+            am = torch.cat([am, torch.ones(2, 1, dtype=am.dtype, device=DEV)], 1)
+            pos = pos[:, -1:] + 1
+            out = m(input_ids=toks[:, i:i + 1], attention_mask=am, position_ids=pos, past_key_values=cache,
+                    use_cache=True)
+            logs.append(out.logits[:, -1].float())
+        return torch.stack(logs, 1)
+
+    kw = dict(attention_mask=mask, max_new_tokens=N, min_new_tokens=N, do_sample=False)
+    with torch.no_grad():
+        m.set_attn_implementation("sdpa")
+        ref_tok = m.generate(ids, **kw)[:, P:]
+        ref = forced(DynamicCache(config=cfg), ref_tok)
+        enable(m)
+        c = StateTreeKVCache(cfg, batch_size=2, max_cache_len=P + N + 8)
+        got_tok = m.generate(ids, past_key_values=c, **kw)[:, P:]
+        c.check()
+        assert got_tok.shape == (2, N) and torch.equal(got_tok[:, :4], ref_tok[:, :4]), (got_tok, ref_tok)
+        c = StateTreeKVCache(cfg, batch_size=2, max_cache_len=P + N + 8)
+        got = forced(c, ref_tok)
+        c.check()
+    assert c.starts[:2].tolist() == [0, PAD], c.starts[:2].tolist()
+    rel = ((got - ref).norm(dim=-1) / ref.norm(dim=-1)).max().item()
+    assert rel < 2e-2, rel
+    agree = (got.argmax(-1) == ref.argmax(-1)).float().mean(1)
+    assert agree.min().item() >= 0.85, agree.tolist()
 
 if __name__ == "__main__":
     for name, fn in list(globals().items()):

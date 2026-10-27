@@ -469,10 +469,12 @@ __global__ void __launch_bounds__(256, 1) tt_kernel(const Args a) {
   }
 }
 
-int num_sms() {
-  static int n = 0;
-  if (!n) n = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
-  return n;
+int num_sms() {                                     // per device: GPUs of a device map may differ
+  static int n[64] = {0};
+  int dev = 0;
+  C10_CUDA_CHECK(cudaGetDevice(&dev));
+  if (!n[dev & 63]) n[dev & 63] = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+  return n[dev & 63];
 }
 // schedule: (G, dp_tiles, sk_tiles, sk_iters). Stream-K (split 0) counts a tile's pieces as the contiguous range of
 // CTAs that own its k-range, so every CTA must own >= 1 k-iteration: problems with fewer k-iterations than SMs run on
@@ -491,10 +493,12 @@ void launch(Args a) {
   a.esc_smem = base + a.CAP * 4 <= SMEM_MAX;          // rare escape-heavy matrices: entries read from global
   const int smem = base + (a.esc_smem ? a.CAP * 4 : 0);
   TORCH_CHECK(smem <= SMEM_MAX, "tt: shared memory ", smem, " too large");
-  static bool set = false;
-  if (!set) {
+  static bool set[64] = {false};                     // the attribute is per device (layers spread over GPUs)
+  int dev = 0;
+  C10_CUDA_CHECK(cudaGetDevice(&dev));
+  if (!set[dev & 63]) {
     C10_CUDA_CHECK(cudaFuncSetAttribute(tt_kernel<TT, NWT>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX));
-    set = true;
+    set[dev & 63] = true;
   }
   tt_kernel<TT, NWT><<<a.G, 256, smem, at::cuda::getCurrentCUDAStream()>>>(a);
   C10_CUDA_KERNEL_LAUNCH_CHECK();

@@ -21,7 +21,7 @@ import torch.nn as nn
 from . import format as F
 from .ops import ext, tgx_ext
 
-__all__ = ["TreeLinear", "TreeSlice", "TreeEmbedding", "BUCKETS"]
+__all__ = ["TreeLinear", "TreeSlice", "TreeEmbedding", "BUCKETS", "EscapeHeavy", "MAX_ESCAPE_FRACTION"]
 
 # tm kernel configurations: cfg -> (R, NTW, WR, WB, ST, OCC); rows per CTA = 16 * WR * R, batch per CTA = 8 * WB * NTW
 TM_CFGS = {0: (1, 2, 8, 1, 6, 1), 1: (1, 2, 8, 1, 4, 2), 2: (1, 4, 8, 1, 6, 1), 3: (1, 4, 8, 1, 4, 2),
@@ -29,6 +29,13 @@ TM_CFGS = {0: (1, 2, 8, 1, 6, 1), 1: (1, 2, 8, 1, 4, 2), 2: (1, 4, 8, 1, 6, 1), 
            8: (2, 8, 8, 1, 2, 2), 9: (1, 16, 4, 1, 2, 3), 10: (2, 8, 4, 1, 2, 3), 14: (1, 8, 4, 1, 2, 4)}
 BUCKETS = (1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 160, 192, 224, 256, 320, 384, 512, 640, 768, 1024)
 BIG = 1 << 30                                       # batches above 1024: decode + cuBLAS with prefetch
+# matrices with more escapes than this fraction stay BF16: each escape costs 80 bits and a patch in every kernel, so
+# such a tree is larger and slower than BF16 (seen on a few MoE expert tensors with a very wide exponent range)
+MAX_ESCAPE_FRACTION = float(os.environ.get("STATETREE_MAX_ESCAPES", "0.01"))
+
+
+class EscapeHeavy(ValueError):
+    """the matrix has more escapes than max_escape_fraction allows: keep it in BF16"""
 TUNE_VERSION = 4                  # 4: tt stream-K fix (small problems); plans tuned before it are re-tuned
 # tt: main-loop cycles per 64-k tile per CTA by (TT, NWT) (A100, whole chip busy): the cost model that ranks tile shapes
 TT_CYC = {(96, 2): 1350, (128, 2): 1630, (160, 2): 1880, (192, 2): 2250, (224, 2): 2640, (256, 2): 2945,
@@ -280,6 +287,16 @@ class _DevState:
             self.ws = torch.empty(int(n), dtype=torch.float32, device=self.dev)
         return self.ws
 
+    def get_mfd(self, n_act, n_cnt):
+        """activation scratch and counters of the fused MoE decode kernel (counters stay zero between calls)"""
+        a = getattr(self, "mfd_act", None)
+        if a is None or a.numel() < n_act or self.mfd_cnt.numel() < n_cnt:
+            if a is not None:
+                self._keep += [a, self.mfd_cnt]
+            self.mfd_act = torch.empty(max(int(n_act), 1 << 17), dtype=torch.bfloat16, device=self.dev)
+            self.mfd_cnt = torch.zeros(max(int(n_cnt), 1 << 12), dtype=torch.int32, device=self.dev)
+        return self.mfd_act, self.mfd_cnt
+
     def get_tgx(self, M, N):
         """ring buffer (R strips of 128 x N BF16, about <= 64 MB) and counters of the large-batch kernel"""
         NS = M // 128
@@ -335,10 +352,14 @@ _STATES = {}
 
 
 def _state(dev):
+    """workspaces, split-K semaphores and decode scratch of the current CUDA stream on dev: layers that run
+    concurrently on two streams (e.g. vLLM's MoE shared expert on its side stream while the router and the routed
+    experts run on the main one) must not share them"""
     idx = dev.index if dev.index is not None else torch.cuda.current_device()
-    st = _STATES.get(idx)
+    key = (idx, torch.cuda.current_stream(idx).cuda_stream)
+    st = _STATES.get(key)
     if st is None:
-        st = _STATES[idx] = _DevState(torch.device("cuda", idx))
+        st = _STATES[key] = _DevState(torch.device("cuda", idx))
     return st
 
 
@@ -409,6 +430,65 @@ def _compiling():
 _REGISTRY = weakref.WeakValueDictionary()        # handle -> module, for the torch.compile custom op
 
 
+def tt_escape_tables(M, N, esc_rows, esc_cols, esc_bits):
+    """escape tables of the tt / gtt kernels for an M x N tree (M % 128 == 0), per 128-row block rb: koff[rb, kt] =
+    start of k-tile kt's escapes (KS ints per row) and ent[rb, :CAP] = bf16 bits << 16 | record << 10 | row << 6 |
+    col, sorted by k-tile. Returns (koff, ent, KS, CAP), int32. One host sync (CAP)."""
+    dev = esc_rows.device
+    er, ec = esc_rows.long(), esc_cols.long()
+    eb = esc_bits.long() & 0xFFFF
+    NG, nrb = N // 64, M // 128
+    KS = (NG + 1 + 3) // 4 * 4
+    rb, kt = er // 128, ec // 64
+    key = rb * NG + kt
+    cnt = (torch.bincount(key, minlength=nrb * NG).view(nrb, NG) if er.numel()
+           else torch.zeros(nrb, NG, dtype=torch.long, device=dev))
+    per = cnt.sum(1)
+    CAP = max(4, (int(per.max().item()) + 3) // 4 * 4)
+    koff = torch.zeros(nrb, KS, dtype=torch.long, device=dev)
+    koff[:, 1:NG + 1] = cnt.cumsum(1)
+    koff[:, NG + 1:] = koff[:, NG:NG + 1]
+    ent = torch.zeros(nrb, CAP, dtype=torch.long, device=dev)
+    if er.numel():
+        order = torch.argsort(key, stable=True)
+        er_, ec_, eb_, rb_ = er[order], ec[order], eb[order], rb[order]
+        start = torch.zeros(nrb + 1, dtype=torch.long, device=dev)
+        start[1:] = per.cumsum(0)
+        pos = torch.arange(er_.numel(), device=dev) - start[rb_]
+        ent[rb_, pos] = (eb_ << 16) | (((er_ % 128) // 16) << 10) | ((er_ % 16) << 6) | (ec_ % 64)
+    return F._i32(koff.view(-1)), F._i32(ent.view(-1)), KS, CAP
+
+
+def gtt_escape_tables(M, N, esc_rows, esc_cols, esc_bits):
+    """escape tables of the grouped tree GEMM (csrc/gtt.cu) for an M x N tree (M % 128 == 0; MoE experts stacked one
+    after the other): the tt entries without padding, ent holding every 128-row block's entries back to back and
+    koff[rb, kt] the absolute start of k-tile kt's entries of block rb (koff[rb, N / 64] = the block's end). CAP = the
+    largest block's entry count (the kernel copies a block's list to shared memory when it fits). With padding to a
+    common CAP, one escape-dense block would size every block's list (1.3 GiB per GPU for Qwen3.6-35B-A3B at TP = 2).
+    Returns (koff, ent, KS, CAP), int32. One host sync."""
+    dev = esc_rows.device
+    er, ec = esc_rows.long(), esc_cols.long()
+    eb = esc_bits.long() & 0xFFFF
+    NG, nrb = N // 64, M // 128
+    KS = (NG + 1 + 3) // 4 * 4
+    key = (er // 128) * NG + ec // 64
+    cnt = (torch.bincount(key, minlength=nrb * NG) if er.numel()
+           else torch.zeros(nrb * NG, dtype=torch.long, device=dev))
+    start = torch.zeros(nrb * NG + 1, dtype=torch.long, device=dev)
+    start[1:] = cnt.cumsum(0)
+    idx = torch.arange(nrb, device=dev).unsqueeze(1) * NG + torch.arange(NG + 1, device=dev)
+    koff = torch.empty(nrb, KS, dtype=torch.long, device=dev)
+    koff[:, :NG + 1] = start[idx]
+    koff[:, NG + 1:] = koff[:, NG:NG + 1]
+    CAP = max(4, (int(cnt.view(nrb, NG).sum(1).max().item()) + 3) // 4 * 4)
+    ent = torch.zeros(er.numel() + 4, dtype=torch.long, device=dev)
+    if er.numel():
+        order = torch.argsort(key, stable=True)
+        er_, ec_, eb_ = er[order], ec[order], eb[order]
+        ent[:er.numel()] = (eb_ << 16) | (((er_ % 128) // 16) << 10) | ((er_ % 16) << 6) | (ec_ % 64)
+    return F._i32(koff.view(-1)), F._i32(ent), KS, CAP
+
+
 class TreeLinear(nn.Module):
     """y = x W^T (+ b) with W [out, in] BF16 stored as a lossless state tree (~12.1 bits/weight).
 
@@ -443,25 +523,30 @@ class TreeLinear(nn.Module):
 
     # ---------------------------------------------------------------- construction / state dict
     @classmethod
-    def from_linear(cls, lin, verify=True):
-        return cls.from_weight(lin.weight, lin.bias, verify=verify)
+    def from_linear(cls, lin, verify=True, max_escape_fraction=None):
+        return cls.from_weight(lin.weight, lin.bias, verify=verify, max_escape_fraction=max_escape_fraction)
 
     @classmethod
     @torch.no_grad()
-    def from_weight(cls, W, bias=None, verify=True):
-        """W [out, in] bf16 (e.g. a Linear weight, an embedding table, or several weights concatenated)."""
+    def from_weight(cls, W, bias=None, verify=True, max_escape_fraction=None):
+        """W [out, in] bf16 (e.g. a Linear weight, an embedding table, or several weights concatenated).
+        max_escape_fraction: raise EscapeHeavy (before any side table is built) when more weights escape."""
         W = W.detach()
         assert W.dtype == torch.bfloat16, f"TreeLinear: weight dtype {W.dtype}, expected bfloat16"
         work = W if W.is_cuda or not torch.cuda.is_available() else W.cuda()
+        if max_escape_fraction is not None:
+            k = F.escape_count(work)
+            if k > max_escape_fraction * work.numel():
+                raise EscapeHeavy(f"{k / work.numel():.2%} of the weights escape")
         enc = F.encode(work)
         n = int(enc["esc_rows"].numel())
-        self = cls(W.shape[1], W.shape[0], bias=bias is not None, device=W.device, n_esc=n)
-        self.tree.copy_(enc["tree"])
-        self.esc_rows.copy_(enc["esc_rows"])
-        self.esc_cols.copy_(enc["esc_cols"])
-        self.esc_bits.copy_(enc["esc_bits"])
+        self = cls(W.shape[1], W.shape[0], bias=bias is not None, device="meta", n_esc=n)
+        for name in ("tree", "esc_rows", "esc_cols", "esc_bits"):     # adopt the encoded tensors (no copies; peak
+            self._buffers[name] = enc[name].to(W.device)                # memory: the tree once)
+        del enc
         if bias is not None:
-            self.bias.copy_(bias.detach().to(torch.bfloat16))
+            self._buffers["bias"] = bias.detach().to(device=W.device, dtype=torch.bfloat16).clone()
+        self._reset_runtime()
         if verify:
             got = self.dequantize() if self.tree.is_cuda else F.decode_reference(self.tree, self.esc_rows,
                                                                                   self.esc_cols, self.esc_bits)
@@ -520,30 +605,8 @@ class TreeLinear(nn.Module):
         ent[rb, :CAP] = bf16 bits << 16 | record << 10 | row << 6 | col, sorted by k-tile"""
         k = (self.tree.device, "tt")
         if k not in self._rt:
-            M, N = self.out_features, self.in_features
-            dev = self.tree.device
-            er, ec = self.esc_rows.long(), self.esc_cols.long()
-            eb = self.esc_bits.long() & 0xFFFF
-            NG, nrb = N // 64, M // 128
-            KS = (NG + 1 + 3) // 4 * 4
-            rb, kt = er // 128, ec // 64
-            key = rb * NG + kt
-            cnt = (torch.bincount(key, minlength=nrb * NG).view(nrb, NG) if er.numel()
-                   else torch.zeros(nrb, NG, dtype=torch.long, device=dev))
-            per = cnt.sum(1)
-            CAP = max(4, (int(per.max().item()) + 3) // 4 * 4)
-            koff = torch.zeros(nrb, KS, dtype=torch.long, device=dev)
-            koff[:, 1:NG + 1] = cnt.cumsum(1)
-            koff[:, NG + 1:] = koff[:, NG:NG + 1]
-            ent = torch.zeros(nrb, CAP, dtype=torch.long, device=dev)
-            if er.numel():
-                order = torch.argsort(key, stable=True)
-                er_, ec_, eb_, rb_ = er[order], ec[order], eb[order], rb[order]
-                start = torch.zeros(nrb + 1, dtype=torch.long, device=dev)
-                start[1:] = per.cumsum(0)
-                pos = torch.arange(er_.numel(), device=dev) - start[rb_]
-                ent[rb_, pos] = (eb_ << 16) | (((er_ % 128) // 16) << 10) | ((er_ % 16) << 6) | (ec_ % 64)
-            self._rt[k] = (F._i32(koff.view(-1)), F._i32(ent.view(-1)), KS, CAP)
+            self._rt[k] = tt_escape_tables(self.out_features, self.in_features, self.esc_rows, self.esc_cols,
+                                           self.esc_bits)
         return self._rt[k]
 
     def _valid(self, path, prm, B):

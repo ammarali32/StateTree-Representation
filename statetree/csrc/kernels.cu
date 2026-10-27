@@ -77,6 +77,39 @@ __device__ __forceinline__ void patch_regs(const uint32_t* EL, int lo, int hi, i
   }
 }
 
+// Escape patching for records with many escapes (the down projections of some MoE layers: up to ~430 of a record's
+// 1024 weights): the warp loads the record's entries once, 32 at a time, and scatters them into a per-warp shared
+// image (wv: 32 halves per lane, wm: one bit mask per lane, bit = s * 8 + q * 2 + half = entry & 31); each lane then
+// patches only its own set bits at every k-step. patch_regs above re-reads the whole list at each of the 4 k-steps,
+// one entry at a time (O(4 n) dependent loads per warp). lo / hi are warp-uniform; the image is reused per record.
+constexpr int ESC_IMG_BYTES = 32 * 4 + 1024 * 2;                // one warp's escape image (mask words + halves)
+__device__ __forceinline__ uint32_t esc_scatter(const uint32_t* EL, int lo, int hi, int lane, uint32_t* wm,
+                                                uint16_t* wv) {
+  __syncwarp();                                                  // every lane is done with the previous image
+  wm[lane] = 0u;
+  __syncwarp();
+#pragma unroll 2
+  for (int e = lo + lane; e < hi; e += 32) {
+    const uint32_t v = __ldg(EL + e);
+    const int L = (v >> 5) & 31, b = v & 31;
+    wv[L * 32 + b] = (uint16_t)(v >> 16);
+    atomicOr(wm + L, 1u << b);
+  }
+  __syncwarp();
+  return wm[lane];
+}
+__device__ __forceinline__ void esc_apply(uint32_t m, const uint16_t* wvl, int s, uint32_t* A) {
+  uint32_t bits = (m >> (8 * s)) & 0xFFu;
+  while (bits) {
+    const int b = __ffs(bits) - 1;
+    bits &= bits - 1;
+    const int r = b >> 1;
+    const uint32_t sh = (uint32_t)(b & 1) * 16u, mask = 0xFFFFu << sh, val = (uint32_t)wvl[8 * s + b] << sh;
+#pragma unroll
+    for (int q = 0; q < 4; ++q) A[q] = (r == q) ? ((A[q] & ~mask) | val) : A[q];
+  }
+}
+
 __device__ __forceinline__ bool merge7(const A7& a, float* out, int elems, int tile_id, int ks, int KS) {
   __shared__ int s_last;
   float* ws = a.WS + (size_t)tile_id * KS * elems;
@@ -129,6 +162,8 @@ __device__ __forceinline__ void load_f7(F7<NT>& f, const A7& a, int tile, int G,
 template <int NT, int PF>
 __global__ void __launch_bounds__(256) mv7_kernel(A7 a) {
   extern __shared__ float smem[];
+  uint32_t (*s_em)[32] = (uint32_t (*)[32])(smem + (a.WK + 1) * a.WM * 16 * NT * 8);      // per-warp escape images (esc_scatter) after the
+  uint16_t (*s_ev)[1024] = (uint16_t (*)[1024])(s_em + a.WM * a.WK);  // reduction buffers: ESC_IMG_BYTES per warp
   const int NG = a.N / 64;
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   const int g = lane >> 2, t = lane & 3;
@@ -149,11 +184,12 @@ __global__ void __launch_bounds__(256) mv7_kernel(A7 a) {
     for (int i = 0; i < PF; ++i) {
       if (G + i < G1) {
         const uint32_t E0 = (f[i].e & 0xFFu) * 0x01010101u, E1 = ((f[i].e >> 8) & 0xFFu) * 0x01010101u;
+        const uint32_t pm = (f[i].lo < f[i].hi) ? esc_scatter(a.EL, f[i].lo, f[i].hi, lane, s_em[warp], s_ev[warp]) : 0u;
 #pragma unroll
         for (int s = 0; s < 4; ++s) {
           uint32_t A[4];
           dec_step5(f[i].c0, f[i].c1, f[i].c2, E0, E1, s, A);
-          if (f[i].lo < f[i].hi) patch_regs(a.EL, f[i].lo, f[i].hi, lane, s, A);
+          if (pm) esc_apply(pm, s_ev[warp] + lane * 32, s, A);
 #pragma unroll
           for (int nt = 0; nt < NT; ++nt) mma16816(c[nt], A, f[i].x[nt][2 * s], f[i].x[nt][2 * s + 1]);
         }
@@ -189,7 +225,7 @@ __global__ void __launch_bounds__(256) mv7_kernel(A7 a) {
 template <int NT, int PF>
 void launch_mv7(const A7& a, int GY, cudaStream_t st) {
   dim3 grid(a.M / (16 * a.WM), GY);
-  const size_t sm = (size_t)(a.WK + 1) * a.WM * 16 * NT * 8 * sizeof(float);
+  const size_t sm = (size_t)(a.WK + 1) * a.WM * 16 * NT * 8 * sizeof(float) + (size_t)a.WM * a.WK * ESC_IMG_BYTES;
   mv7_kernel<NT, PF><<<grid, 32 * a.WM * a.WK, sm, st>>>(a);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -215,6 +251,733 @@ void mv7(torch::Tensor T, torch::Tensor EO, torch::Tensor EL, torch::Tensor X, t
   if (a.B <= 8) { if (PF == 4) launch_mv7<1, 4>(a, G, st); else launch_mv7<1, 2>(a, G, st); }
   else if (a.B <= 16) { if (PF == 4) launch_mv7<2, 4>(a, G, st); else launch_mv7<2, 2>(a, G, st); }
   else { if (PF == 4) launch_mv7<4, 4>(a, G, st); else launch_mv7<4, 2>(a, G, st); }
+}
+
+// ---------------------------------------------------------------------------------------------- mvx (MoE)
+// Mixture-of-experts matrix-vector products without a BF16 copy of the experts: slot s multiplies row s / xdiv of X by
+// the M x N matrix of expert ids[s] (its tree, escape offsets and escape list at TP / EOP / ELP[ids[s]]: separate
+// per-expert trees, or pointers into one stacked [E * M, N] tree) and writes row s of Y. Grid (M / 16WM, GY, S); one
+// input row per slot, so only column 0 of the m16n8k16 B fragment carries data (the kernel is bandwidth bound).
+template <int PF, typename IT>
+__global__ void __launch_bounds__(256) mvx_kernel(A7 a, const int64_t* TP, const int64_t* EOP, const int64_t* ELP,
+                                                  const IT* ids, int xdiv, int nexp) {
+  extern __shared__ float smem[];
+  uint32_t (*s_em)[32] = (uint32_t (*)[32])(smem + (a.WK + 1) * a.WM * 16 * 8);      // per-warp escape images (esc_scatter) after the
+  uint16_t (*s_ev)[1024] = (uint16_t (*)[1024])(s_em + a.WM * a.WK);  // reduction buffers: ESC_IMG_BYTES per warp
+  const int NG = a.N / 64;
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int g = lane >> 2, t = lane & 3;
+  const int wm = warp % a.WM, wk = warp / a.WM;
+  const int slot = blockIdx.z;
+  long long e = (long long)ids[slot];
+  e = e < 0 ? 0 : (e >= nexp ? nexp - 1 : e);                 // vLLM's dummy batches need not route to valid experts
+  A7 b = a;
+  b.T = (const uint8_t*)TP[e];
+  b.EO = (const int*)EOP[e];
+  b.EL = (const uint32_t*)ELP[e];
+  b.X = a.X + (size_t)(slot / xdiv) * a.N;
+  b.B = 1;
+  const int tile = blockIdx.x * a.WM + wm;
+  const int GY = gridDim.y;
+  const int cg0 = NG * blockIdx.y / GY, cg1 = NG * (blockIdx.y + 1) / GY;
+  const int G0 = cg0 + (cg1 - cg0) * wk / a.WK, G1 = cg0 + (cg1 - cg0) * (wk + 1) / a.WK;
+  float c[4] = {0.f, 0.f, 0.f, 0.f};
+  F7<1> f[PF];
+#pragma unroll
+  for (int i = 0; i < PF; ++i)
+    if (G0 + i < G1) load_f7<1>(f[i], b, tile, G0 + i, lane, NG);
+  for (int G = G0; G < G1; G += PF) {
+#pragma unroll
+    for (int i = 0; i < PF; ++i) {
+      if (G + i < G1) {
+        const uint32_t E0 = (f[i].e & 0xFFu) * 0x01010101u, E1 = ((f[i].e >> 8) & 0xFFu) * 0x01010101u;
+        const uint32_t pm = (f[i].lo < f[i].hi) ? esc_scatter(b.EL, f[i].lo, f[i].hi, lane, s_em[warp], s_ev[warp]) : 0u;
+#pragma unroll
+        for (int s = 0; s < 4; ++s) {
+          uint32_t A[4];
+          dec_step5(f[i].c0, f[i].c1, f[i].c2, E0, E1, s, A);
+          if (pm) esc_apply(pm, s_ev[warp] + lane * 32, s, A);
+          mma16816(c, A, f[i].x[0][2 * s], f[i].x[0][2 * s + 1]);
+        }
+        if (G + i + PF < G1) load_f7<1>(f[i], b, tile, G + i + PF, lane, NG);
+      }
+    }
+  }
+  const int R = a.WM * 16, EL = R * 8;
+  float* red = smem;
+  float* out = smem + a.WK * EL;
+  {
+    const int rr = wm * 16 + g, n = 2 * t;
+    red[wk * EL + n * R + rr] = c[0];
+    red[wk * EL + (n + 1) * R + rr] = c[1];
+    red[wk * EL + n * R + rr + 8] = c[2];
+    red[wk * EL + (n + 1) * R + rr + 8] = c[3];
+  }
+  __syncthreads();
+  for (int idx = threadIdx.x; idx < R; idx += blockDim.x) {      // column 0: this slot's input row
+    float s = 0.f;
+    for (int k = 0; k < a.WK; ++k) s += red[k * EL + idx];
+    out[idx] = s;
+  }
+  __syncthreads();
+  if (GY > 1 && !merge7(a, out, R, slot * gridDim.x + blockIdx.x, blockIdx.y, GY)) return;
+  for (int idx = threadIdx.x; idx < R; idx += blockDim.x)
+    a.Y[(size_t)slot * a.M + (size_t)blockIdx.x * R + idx] = __float2bfloat16_rn(out[idx]);
+}
+
+template <int PF, typename IT>
+static void launch_mvx(const A7& a, const int64_t* TP, const int64_t* EOP, const int64_t* ELP, const IT* ids,
+                       int S, int xdiv, int GY, int nexp, cudaStream_t st) {
+  dim3 grid(a.M / (16 * a.WM), GY, S);
+  const size_t sm = (size_t)(a.WK + 1) * a.WM * 16 * 8 * sizeof(float) + (size_t)a.WM * a.WK * ESC_IMG_BYTES;
+  mvx_kernel<PF, IT><<<grid, 32 * a.WM * a.WK, sm, st>>>(a, TP, EOP, ELP, ids, xdiv, nexp);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void mvx(torch::Tensor TP, torch::Tensor EOP, torch::Tensor ELP, torch::Tensor X, torch::Tensor ids, torch::Tensor Y,
+         torch::Tensor WS, torch::Tensor CNT, int64_t xdiv, int64_t WM, int64_t WK, int64_t GY, int64_t PF) {
+  const c10::cuda::OptionalCUDAGuard guard(X.device());
+  auto i64 = [](const torch::Tensor& v) { return v.is_cuda() && v.scalar_type() == at::kLong && v.is_contiguous(); };
+  const bool ids32 = ids.is_cuda() && ids.scalar_type() == at::kInt && ids.is_contiguous();
+  TORCH_CHECK(i64(TP) && i64(EOP) && i64(ELP) && (i64(ids) || ids32) && TP.numel() == EOP.numel() &&
+              TP.numel() == ELP.numel(),
+              "mvx: pointer tables (int64) of equal sizes and ids (int32 or int64) must be contiguous CUDA tensors");
+  TORCH_CHECK(X.is_cuda() && X.dtype() == torch::kBFloat16 && X.is_contiguous() && X.dim() == 2, "mvx: X");
+  TORCH_CHECK(Y.is_cuda() && Y.dtype() == torch::kBFloat16 && Y.is_contiguous() && Y.dim() == 2, "mvx: Y");
+  const int64_t S = ids.numel();
+  TORCH_CHECK(Y.size(0) == S && xdiv >= 1 && X.size(0) * xdiv >= S && S <= 65535, "mvx: rows");
+  A7 a;
+  a.T = nullptr; a.EO = nullptr; a.EL = nullptr;
+  a.X = (const uint16_t*)X.data_ptr<at::BFloat16>(); a.Y = (__nv_bfloat16*)Y.data_ptr<at::BFloat16>();
+  a.WS = WS.data_ptr<float>(); a.CNT = CNT.data_ptr<int>();
+  a.M = (int)Y.size(1); a.N = (int)X.size(1); a.B = 1; a.WM = (int)WM; a.WK = (int)WK;
+  TORCH_CHECK(a.WM >= 1 && a.WK >= 1 && a.WM * a.WK <= 8 && a.M % (16 * a.WM) == 0 && a.N % 64 == 0 && GY >= 1 &&
+              GY <= a.N / 64, "mvx config");
+  const int64_t tiles = a.M / (16 * a.WM);
+  TORCH_CHECK(GY == 1 || (WS.numel() >= S * tiles * GY * a.WM * 16 && CNT.numel() >= S * tiles), "mvx: split-K workspace");
+  if (S == 0) return;
+  cudaStream_t st = at::cuda::getCurrentCUDAStream();
+  const int64_t* tp = TP.data_ptr<int64_t>(); const int64_t* eop = EOP.data_ptr<int64_t>();
+  const int64_t* elp = ELP.data_ptr<int64_t>();
+  const int nexp = (int)TP.numel();
+  if (ids32) {
+    const int* idp = ids.data_ptr<int>();
+    if (PF == 4) launch_mvx<4, int>(a, tp, eop, elp, idp, (int)S, (int)xdiv, (int)GY, nexp, st);
+    else launch_mvx<2, int>(a, tp, eop, elp, idp, (int)S, (int)xdiv, (int)GY, nexp, st);
+  } else {
+    const int64_t* idp = ids.data_ptr<int64_t>();
+    if (PF == 4) launch_mvx<4, int64_t>(a, tp, eop, elp, idp, (int)S, (int)xdiv, (int)GY, nexp, st);
+    else launch_mvx<2, int64_t>(a, tp, eop, elp, idp, (int)S, (int)xdiv, (int)GY, nexp, st);
+  }
+}
+
+// ---------------------------------------------------------------------------------------------- mvg (grouped MoE)
+// Grouped MoE products: the (token, expert) slots sorted by expert into blocks of BS = 8 * NT (vLLM's
+// moe_align_block_size layout: sorted[blk * BS + j] = slot id, >= S for padding; bexp[blk] = the block's expert, < 0
+// for another rank's expert; *npost = used entries of sorted). Block blk multiplies the X rows of its slots (row
+// slot / xdiv) by its expert's M x N matrix, so the expert's tree is read once for up to BS tokens, and writes rows
+// 'slot' of Y. Grid (M / 16WM, GY, blocks); blocks past *npost exit at once.
+template <int NT>
+__device__ __forceinline__ void load_fg(F7<NT>& f, const uint8_t* T, const int* EO, const uint16_t* const (&xr)[NT],
+                                        int tile, int G, int lane, int NG) {
+  const int t = lane & 3;
+  const size_t tg = (size_t)tile * NG + G;
+  const uint8_t* base = T + tg * 1552;
+  f.c0 = ldw(base + lane * 16);
+  f.c1 = ldw(base + 512 + lane * 16);
+  f.c2 = ldw(base + 1024 + lane * 16);
+  f.e = __ldg((const uint16_t*)(base + 1536) + (lane >> 2));
+  f.lo = __ldg(EO + tg);
+  f.hi = __ldg(EO + tg + 1);
+#pragma unroll
+  for (int nt = 0; nt < NT; ++nt) {
+    if (xr[nt] != nullptr) {
+      const uint32_t* xp = (const uint32_t*)(xr[nt] + G * 64 + 2 * t);
+#pragma unroll
+      for (int s = 0; s < 4; ++s) { f.x[nt][2 * s] = __ldg(xp + 8 * s); f.x[nt][2 * s + 1] = __ldg(xp + 8 * s + 4); }
+    } else {
+#pragma unroll
+      for (int q = 0; q < 8; ++q) f.x[nt][q] = 0u;
+    }
+  }
+}
+
+template <int NT, int PF>
+__global__ void __launch_bounds__(256) mvg_kernel(A7 a, const int64_t* TP, const int64_t* EOP, const int64_t* ELP,
+                                                  const int* sorted, const int* bexp, const int* npost, int S,
+                                                  int xdiv, int nexp) {
+  extern __shared__ float smem[];
+  uint32_t (*s_em)[32] = (uint32_t (*)[32])(smem + (a.WK + 1) * a.WM * 16 * NT * 8);      // per-warp escape images (esc_scatter) after the
+  uint16_t (*s_ev)[1024] = (uint16_t (*)[1024])(s_em + a.WM * a.WK);  // reduction buffers: ESC_IMG_BYTES per warp
+  constexpr int BS = NT * 8;
+  __shared__ int s_slot[BS];
+  const int blk = blockIdx.z;
+  if (blk * BS >= __ldg(npost)) return;
+  const int e = __ldg(bexp + blk);
+  if (e < 0 || e >= nexp) return;                               // another rank's expert / an invalid id
+  if (threadIdx.x < BS) s_slot[threadIdx.x] = __ldg(sorted + (size_t)blk * BS + threadIdx.x);
+  __syncthreads();
+  const int NG = a.N / 64;
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int g = lane >> 2, t = lane & 3;
+  const int wm = warp % a.WM, wk = warp / a.WM;
+  const uint8_t* T = (const uint8_t*)TP[e];
+  const int* EO = (const int*)EOP[e];
+  const uint32_t* EL = (const uint32_t*)ELP[e];
+  const uint16_t* xr[NT];
+#pragma unroll
+  for (int nt = 0; nt < NT; ++nt) {
+    const int sid = s_slot[nt * 8 + g];
+    xr[nt] = (sid >= 0 && sid < S) ? a.X + (size_t)(sid / xdiv) * a.N : nullptr;
+  }
+  const int tile = blockIdx.x * a.WM + wm;
+  const int GY = gridDim.y;
+  const int cg0 = NG * blockIdx.y / GY, cg1 = NG * (blockIdx.y + 1) / GY;
+  const int G0 = cg0 + (cg1 - cg0) * wk / a.WK, G1 = cg0 + (cg1 - cg0) * (wk + 1) / a.WK;
+  float c[NT][4];
+#pragma unroll
+  for (int nt = 0; nt < NT; ++nt) c[nt][0] = c[nt][1] = c[nt][2] = c[nt][3] = 0.f;
+  F7<NT> f[PF];
+#pragma unroll
+  for (int i = 0; i < PF; ++i)
+    if (G0 + i < G1) load_fg<NT>(f[i], T, EO, xr, tile, G0 + i, lane, NG);
+  for (int G = G0; G < G1; G += PF) {
+#pragma unroll
+    for (int i = 0; i < PF; ++i) {
+      if (G + i < G1) {
+        const uint32_t E0 = (f[i].e & 0xFFu) * 0x01010101u, E1 = ((f[i].e >> 8) & 0xFFu) * 0x01010101u;
+        const uint32_t pm = (f[i].lo < f[i].hi) ? esc_scatter(EL, f[i].lo, f[i].hi, lane, s_em[warp], s_ev[warp]) : 0u;
+#pragma unroll
+        for (int s = 0; s < 4; ++s) {
+          uint32_t A[4];
+          dec_step5(f[i].c0, f[i].c1, f[i].c2, E0, E1, s, A);
+          if (pm) esc_apply(pm, s_ev[warp] + lane * 32, s, A);
+#pragma unroll
+          for (int nt = 0; nt < NT; ++nt) mma16816(c[nt], A, f[i].x[nt][2 * s], f[i].x[nt][2 * s + 1]);
+        }
+        if (G + i + PF < G1) load_fg<NT>(f[i], T, EO, xr, tile, G + i + PF, lane, NG);
+      }
+    }
+  }
+  const int R = a.WM * 16, ELN = R * BS;
+  float* red = smem;
+  float* out = smem + a.WK * ELN;
+#pragma unroll
+  for (int nt = 0; nt < NT; ++nt) {
+    const int rr = wm * 16 + g, n = nt * 8 + 2 * t;
+    red[wk * ELN + n * R + rr] = c[nt][0];
+    red[wk * ELN + (n + 1) * R + rr] = c[nt][1];
+    red[wk * ELN + n * R + rr + 8] = c[nt][2];
+    red[wk * ELN + (n + 1) * R + rr + 8] = c[nt][3];
+  }
+  __syncthreads();
+  for (int idx = threadIdx.x; idx < ELN; idx += blockDim.x) {
+    float s = 0.f;
+    for (int k = 0; k < a.WK; ++k) s += red[k * ELN + idx];
+    out[idx] = s;
+  }
+  __syncthreads();
+  if (GY > 1 && !merge7(a, out, ELN, blk * gridDim.x + blockIdx.x, blockIdx.y, GY)) return;
+  for (int idx = threadIdx.x; idx < ELN; idx += blockDim.x) {
+    const int n = idx / R, r = idx % R;
+    const int sid = s_slot[n];
+    if (sid >= 0 && sid < S) a.Y[(size_t)sid * a.M + (size_t)blockIdx.x * R + r] = __float2bfloat16_rn(out[idx]);
+  }
+}
+
+template <int NT>
+static void launch_mvg(const A7& a, const int64_t* TP, const int64_t* EOP, const int64_t* ELP, const int* sorted,
+                       const int* bexp, const int* npost, int S, int xdiv, int nblk, int GY, int nexp,
+                       cudaStream_t st) {
+  dim3 grid(a.M / (16 * a.WM), GY, nblk);
+  const size_t sm = (size_t)(a.WK + 1) * a.WM * 16 * NT * 8 * sizeof(float) + (size_t)a.WM * a.WK * ESC_IMG_BYTES;
+  mvg_kernel<NT, 2><<<grid, 32 * a.WM * a.WK, sm, st>>>(a, TP, EOP, ELP, sorted, bexp, npost, S, xdiv, nexp);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void mvg(torch::Tensor TP, torch::Tensor EOP, torch::Tensor ELP, torch::Tensor X, torch::Tensor sorted,
+         torch::Tensor bexp, torch::Tensor npost, torch::Tensor Y, torch::Tensor WS, torch::Tensor CNT, int64_t xdiv,
+         int64_t NT, int64_t WM, int64_t WK, int64_t GY) {
+  const c10::cuda::OptionalCUDAGuard guard(X.device());
+  auto i64 = [](const torch::Tensor& v) { return v.is_cuda() && v.scalar_type() == at::kLong && v.is_contiguous(); };
+  auto i32 = [](const torch::Tensor& v) { return v.is_cuda() && v.scalar_type() == at::kInt && v.is_contiguous(); };
+  TORCH_CHECK(i64(TP) && i64(EOP) && i64(ELP) && TP.numel() == EOP.numel() && TP.numel() == ELP.numel(),
+              "mvg: pointer tables must be contiguous int64 CUDA tensors of one size");
+  TORCH_CHECK(i32(sorted) && i32(bexp) && i32(npost) && npost.numel() >= 1, "mvg: sorted / bexp / npost int32");
+  TORCH_CHECK(NT == 1 || NT == 2 || NT == 4, "mvg: NT 1, 2 or 4");
+  TORCH_CHECK(sorted.numel() >= (bexp.numel() - 1) * 8 * NT + 1 || bexp.numel() == 0, "mvg: sorted too short");
+  TORCH_CHECK(X.is_cuda() && X.dtype() == torch::kBFloat16 && X.is_contiguous() && X.dim() == 2, "mvg: X");
+  TORCH_CHECK(Y.is_cuda() && Y.dtype() == torch::kBFloat16 && Y.is_contiguous() && Y.dim() == 2, "mvg: Y");
+  const int64_t S = Y.size(0), nblk = bexp.numel();
+  TORCH_CHECK(xdiv >= 1 && X.size(0) * xdiv >= S && nblk <= 65535, "mvg: rows / blocks");
+  A7 a;
+  a.T = nullptr; a.EO = nullptr; a.EL = nullptr;
+  a.X = (const uint16_t*)X.data_ptr<at::BFloat16>(); a.Y = (__nv_bfloat16*)Y.data_ptr<at::BFloat16>();
+  a.WS = WS.data_ptr<float>(); a.CNT = CNT.data_ptr<int>();
+  a.M = (int)Y.size(1); a.N = (int)X.size(1); a.B = 0; a.WM = (int)WM; a.WK = (int)WK;
+  TORCH_CHECK(a.WM >= 1 && a.WK >= 1 && a.WM * a.WK <= 8 && a.M % (16 * a.WM) == 0 && a.N % 64 == 0 && GY >= 1 &&
+              GY <= a.N / 64, "mvg config");
+  const int64_t tiles = a.M / (16 * a.WM);
+  TORCH_CHECK(GY == 1 || (WS.numel() >= nblk * tiles * GY * a.WM * 16 * 8 * NT && CNT.numel() >= nblk * tiles),
+              "mvg: split-K workspace");
+  if (S == 0 || nblk == 0) return;
+  cudaStream_t st = at::cuda::getCurrentCUDAStream();
+  const int64_t* tp = TP.data_ptr<int64_t>(); const int64_t* eop = EOP.data_ptr<int64_t>();
+  const int64_t* elp = ELP.data_ptr<int64_t>();
+  const int* so = sorted.data_ptr<int>(); const int* be = bexp.data_ptr<int>(); const int* np = npost.data_ptr<int>();
+  const int ne = (int)TP.numel();
+  if (NT == 1) launch_mvg<1>(a, tp, eop, elp, so, be, np, (int)S, (int)xdiv, (int)nblk, (int)GY, ne, st);
+  else if (NT == 2) launch_mvg<2>(a, tp, eop, elp, so, be, np, (int)S, (int)xdiv, (int)nblk, (int)GY, ne, st);
+  else launch_mvg<4>(a, tp, eop, elp, so, be, np, (int)S, (int)xdiv, (int)nblk, (int)GY, ne, st);
+}
+
+// ---------------------------------------------------------------------------------------------- mvw (MoE, small K)
+// Persistent warp-per-unit expert products for matrices with few 64-column groups (NG = N / 64 even, <= 16: the down
+// projection, N = I). A unit is (chunk, 16-row tile). Each warp computes whole units (all NG groups accumulate in its
+// mma registers: no cross-warp reduction, no block barrier) and streams its units (u, u + NW, ...) through a ring of
+// two records, so the next unit's records load while the current one is multiplied; the next unit's expert pointers
+// and the unit after that's chunk metadata are fetched one iteration ahead. Grid: a few blocks of 4 warps per SM
+// (mvx / mvg launch one block per tile and chunk, most of them tiny or empty at decode sizes).
+//   MODE 0 (mvx layout): chunk = slot s: expert ids[s] (clamped), input row s / xdiv, output row s (B column 0).
+//   MODE 1 (mvg layout, moe_align_block_size with block size 8): chunk c = 8 sorted slots of expert bexp[c] (< 0 or
+//   >= E: another rank's expert, not written), ceil(*npost / 8) chunks; padding slots (>= S) are zero columns.
+template <typename IT>
+struct MW {
+  const int64_t* TP; const int64_t* EOP; const int64_t* ELP;
+  const uint16_t* X; __nv_bfloat16* Y;
+  const IT* ids; const int* sorted; const int* bexp; const int* npost;
+  int S, M, N, xdiv, nexp, nsorted;
+};
+struct MWA { long long e; int sg, s0, s1; };                     // chunk metadata of a unit (sg < 0 in MODE 0: none)
+struct MWB { const uint8_t* T; const int* EO; const uint32_t* EL; const uint16_t* xr; int o0, o1; };  // T null: none
+
+template <int MODE, typename IT>
+__device__ __forceinline__ MWA mw_fetch(const MW<IT>& p, int u, int U, int TILES, int g, int t) {
+  MWA a; a.e = -1; a.sg = a.s0 = a.s1 = -1;
+  if (u < U) {
+    const int c = u / TILES;
+    if (MODE == 0) {
+      a.e = (long long)p.ids[c]; a.sg = c;
+    } else {
+      a.e = __ldg(p.bexp + c);
+      const int b = c * 8;
+      a.sg = (b + g < p.nsorted) ? __ldg(p.sorted + b + g) : -1;
+      a.s0 = (b + 2 * t < p.nsorted) ? __ldg(p.sorted + b + 2 * t) : -1;
+      a.s1 = (b + 2 * t + 1 < p.nsorted) ? __ldg(p.sorted + b + 2 * t + 1) : -1;
+    }
+  }
+  return a;
+}
+
+template <int MODE, typename IT>
+__device__ __forceinline__ MWB mw_resolve(const MW<IT>& p, const MWA& a, int g, int t) {
+  MWB b; b.T = nullptr; b.EO = nullptr; b.EL = nullptr; b.xr = nullptr; b.o0 = b.o1 = -1;
+  long long e = a.e;
+  bool ok;
+  if (MODE == 0) { ok = a.sg >= 0; e = e < 0 ? 0 : (e >= p.nexp ? p.nexp - 1 : e); }
+  else ok = e >= 0 && e < p.nexp;
+  if (ok) {
+    b.T = (const uint8_t*)p.TP[e]; b.EO = (const int*)p.EOP[e]; b.EL = (const uint32_t*)p.ELP[e];
+    if (MODE == 0) {
+      b.xr = (g == 0) ? p.X + (size_t)(a.sg / p.xdiv) * p.N : nullptr;
+      b.o0 = (t == 0) ? a.sg : -1;
+    } else {
+      b.xr = (a.sg >= 0 && a.sg < p.S) ? p.X + (size_t)(a.sg / p.xdiv) * p.N : nullptr;
+      b.o0 = (a.s0 >= 0 && a.s0 < p.S) ? a.s0 : -1;
+      b.o1 = (a.s1 >= 0 && a.s1 < p.S) ? a.s1 : -1;
+    }
+  }
+  return b;
+}
+
+__device__ __forceinline__ void mw_load(F7<1>& f, const MWB& b, int tile, int G, int lane, int NG) {
+  if (b.T != nullptr) {
+    const uint16_t* xr[1] = {b.xr};
+    load_fg<1>(f, b.T, b.EO, xr, tile, G, lane, NG);
+  } else {
+    f.c0 = f.c1 = f.c2 = make_uint4(0u, 0u, 0u, 0u);
+    f.e = 0u; f.lo = f.hi = 0;
+#pragma unroll
+    for (int q = 0; q < 8; ++q) f.x[0][q] = 0u;
+  }
+}
+
+template <int MODE, typename IT>
+__global__ void __launch_bounds__(128, 4) mvw_kernel(MW<IT> p) {
+  __shared__ uint32_t s_em[4][32];                            // escape images (esc_scatter), one per warp
+  __shared__ uint16_t s_ev[4][1024];
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int g = lane >> 2, t = lane & 3;
+  const int TILES = p.M / 16, NG = p.N / 64;
+  const int U = (MODE == 0 ? p.S : (__ldg(p.npost) + 7) / 8) * TILES;
+  const int NW = gridDim.x * 4;
+  int u = blockIdx.x * 4 + warp;
+  if (u >= U) return;
+  MWA a1 = mw_fetch<MODE>(p, u, U, TILES, g, t);
+  const MWA a2 = mw_fetch<MODE>(p, u + NW, U, TILES, g, t);
+  MWB b0 = mw_resolve<MODE>(p, a1, g, t);
+  a1 = a2;                                                       // chunk metadata of the next unit
+  F7<1> f[2];
+  mw_load(f[0], b0, u % TILES, 0, lane, NG);
+  mw_load(f[1], b0, u % TILES, 1, lane, NG);
+  for (;;) {
+    const int un = u + NW;
+    const MWB b1 = mw_resolve<MODE>(p, a1, g, t);               // the next unit's expert pointers
+    a1 = mw_fetch<MODE>(p, un + NW, U, TILES, g, t);             // the unit after that's chunk metadata
+    const int tile = u % TILES, tilen = un % TILES;
+    float c[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int G = 0; G < NG; G += 2) {
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        const uint32_t E0 = (f[i].e & 0xFFu) * 0x01010101u, E1 = ((f[i].e >> 8) & 0xFFu) * 0x01010101u;
+        const uint32_t pm = (f[i].lo < f[i].hi) ? esc_scatter(b0.EL, f[i].lo, f[i].hi, lane, s_em[warp], s_ev[warp]) : 0u;
+#pragma unroll
+        for (int st = 0; st < 4; ++st) {
+          uint32_t A[4];
+          dec_step5(f[i].c0, f[i].c1, f[i].c2, E0, E1, st, A);
+          if (pm) esc_apply(pm, s_ev[warp] + lane * 32, st, A);
+          mma16816(c, A, f[i].x[0][2 * st], f[i].x[0][2 * st + 1]);
+        }
+        const int Gn = G + i + 2;
+        if (Gn < NG) mw_load(f[i], b0, tile, Gn, lane, NG);
+        else if (un < U) mw_load(f[i], b1, tilen, Gn - NG, lane, NG);
+      }
+    }
+    if (b0.T != nullptr) {
+      __nv_bfloat16* y = p.Y + (size_t)tile * 16 + g;
+      if (b0.o0 >= 0) {
+        y[(size_t)b0.o0 * p.M] = __float2bfloat16_rn(c[0]);
+        y[(size_t)b0.o0 * p.M + 8] = __float2bfloat16_rn(c[2]);
+      }
+      if (MODE == 1 && b0.o1 >= 0) {
+        y[(size_t)b0.o1 * p.M] = __float2bfloat16_rn(c[1]);
+        y[(size_t)b0.o1 * p.M + 8] = __float2bfloat16_rn(c[3]);
+      }
+    }
+    if (un >= U) break;
+    u = un;
+    b0 = b1;
+  }
+}
+
+static int mvw_blocks(int64_t units, int64_t nbps, const torch::Tensor& like) {
+  const int sms = at::cuda::getDeviceProperties(like.device().index())->multiProcessorCount;
+  const int64_t need = (units + 3) / 4;
+  return (int)std::max<int64_t>(1, std::min<int64_t>(need, std::max<int64_t>(1, nbps) * sms));
+}
+
+static void mvw_check(const torch::Tensor& TP, const torch::Tensor& EOP, const torch::Tensor& ELP,
+                      const torch::Tensor& X, const torch::Tensor& Y, const char* who) {
+  auto i64 = [](const torch::Tensor& v) { return v.is_cuda() && v.scalar_type() == at::kLong && v.is_contiguous(); };
+  TORCH_CHECK(i64(TP) && i64(EOP) && i64(ELP) && TP.numel() == EOP.numel() && TP.numel() == ELP.numel(), who,
+              ": pointer tables must be contiguous int64 CUDA tensors of one size");
+  TORCH_CHECK(X.is_cuda() && X.dtype() == torch::kBFloat16 && X.is_contiguous() && X.dim() == 2, who, ": X");
+  TORCH_CHECK(Y.is_cuda() && Y.dtype() == torch::kBFloat16 && Y.is_contiguous() && Y.dim() == 2, who, ": Y");
+  TORCH_CHECK(Y.size(1) % 16 == 0 && X.size(1) % 128 == 0 && X.size(1) <= 1024, who,
+              ": M % 16 == 0 and N % 128 == 0, N <= 1024 (an even number of 64-column groups, at most 16)");
+}
+
+void mvwx(torch::Tensor TP, torch::Tensor EOP, torch::Tensor ELP, torch::Tensor X, torch::Tensor ids, torch::Tensor Y,
+          int64_t xdiv, int64_t nbps) {
+  const c10::cuda::OptionalCUDAGuard guard(X.device());
+  mvw_check(TP, EOP, ELP, X, Y, "mvwx");
+  const bool ids32 = ids.is_cuda() && ids.scalar_type() == at::kInt && ids.is_contiguous();
+  const bool ids64 = ids.is_cuda() && ids.scalar_type() == at::kLong && ids.is_contiguous();
+  TORCH_CHECK(ids32 || ids64, "mvwx: ids int32 / int64 contiguous");
+  const int64_t S = ids.numel();
+  TORCH_CHECK(Y.size(0) == S && xdiv >= 1 && X.size(0) * xdiv >= S, "mvwx: rows");
+  if (S == 0) return;
+  cudaStream_t st = at::cuda::getCurrentCUDAStream();
+  const int nb = mvw_blocks(S * (Y.size(1) / 16), nbps, X);
+  if (ids32) {
+    MW<int> p{TP.data_ptr<int64_t>(), EOP.data_ptr<int64_t>(), ELP.data_ptr<int64_t>(),
+              (const uint16_t*)X.data_ptr<at::BFloat16>(), (__nv_bfloat16*)Y.data_ptr<at::BFloat16>(),
+              ids.data_ptr<int>(), nullptr, nullptr, nullptr,
+              (int)S, (int)Y.size(1), (int)X.size(1), (int)xdiv, (int)TP.numel(), 0};
+    mvw_kernel<0, int><<<nb, 128, 0, st>>>(p);
+  } else {
+    MW<int64_t> p{TP.data_ptr<int64_t>(), EOP.data_ptr<int64_t>(), ELP.data_ptr<int64_t>(),
+                  (const uint16_t*)X.data_ptr<at::BFloat16>(), (__nv_bfloat16*)Y.data_ptr<at::BFloat16>(),
+                  ids.data_ptr<int64_t>(), nullptr, nullptr, nullptr,
+                  (int)S, (int)Y.size(1), (int)X.size(1), (int)xdiv, (int)TP.numel(), 0};
+    mvw_kernel<0, int64_t><<<nb, 128, 0, st>>>(p);
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void mvwg(torch::Tensor TP, torch::Tensor EOP, torch::Tensor ELP, torch::Tensor X, torch::Tensor sorted,
+          torch::Tensor bexp, torch::Tensor npost, torch::Tensor Y, int64_t xdiv, int64_t nbps) {
+  const c10::cuda::OptionalCUDAGuard guard(X.device());
+  mvw_check(TP, EOP, ELP, X, Y, "mvwg");
+  auto i32 = [](const torch::Tensor& v) { return v.is_cuda() && v.scalar_type() == at::kInt && v.is_contiguous(); };
+  TORCH_CHECK(i32(sorted) && i32(bexp) && i32(npost) && npost.numel() >= 1, "mvwg: sorted / bexp / npost int32");
+  const int64_t S = Y.size(0), nblk = bexp.numel();
+  TORCH_CHECK(xdiv >= 1 && X.size(0) * xdiv >= S, "mvwg: rows");
+  if (S == 0 || nblk == 0) return;
+  cudaStream_t st = at::cuda::getCurrentCUDAStream();
+  const int nb = mvw_blocks(std::min<int64_t>(nblk, S) * (Y.size(1) / 16), nbps, X);   // <= min(blocks, S) chunks
+  MW<int> p{TP.data_ptr<int64_t>(), EOP.data_ptr<int64_t>(), ELP.data_ptr<int64_t>(),
+            (const uint16_t*)X.data_ptr<at::BFloat16>(), (__nv_bfloat16*)Y.data_ptr<at::BFloat16>(),
+            nullptr, sorted.data_ptr<int>(), bexp.data_ptr<int>(), npost.data_ptr<int>(),
+            (int)S, (int)Y.size(1), (int)X.size(1), (int)xdiv, (int)TP.numel(), (int)sorted.numel()};
+  mvw_kernel<1, int><<<nb, 128, 0, st>>>(p);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// ---------------------------------------------------------------------------------------------- mfd (fused MoE decode)
+// The whole routed-expert block of a decode step in one launch, for few (token, expert) pairs:
+//   out[t] = sum_j w[t, j] * W2[e] . (silu(W13gate[e] x[t]) * (W13up[e] x[t])),  e = ids[t k + j], j = 0 .. k-1
+// (vLLM's w13 layout: gate rows [0, I), up rows [I, 2I)). Phase A, blocks [0, S I/16): block (slot s, pair p) computes
+// rows p*16 .. +16 of the gate and of the up projection of slot s (4 warps split each tile's K), rounds both to BF16 and
+// applies silu * up as silu_and_mul does, writes act[s, p*16 .. +16] and counts the slot's finished pairs. Phase B,
+// blocks [S I/16, S I/16 + T H/16): block (token t, tile r) loads the down-projection records of its k experts first
+// (warp j: slot j, the whole K = I), so they arrive while phase A runs, then waits until every pair of those slots is
+// counted, multiplies, rounds each expert's rows to BF16 and sums them with the routing weights in fp32 in expert order,
+// as wsum does: out[t, r*16 .. +16]. Deterministic; the last block of every token resets the counters (CUDA graphs).
+// Blocks start in index order, so all phase A blocks have started before any phase B block waits on them.
+struct MFD {
+  const int64_t *TP13, *EOP13, *ELP13, *TP2, *EOP2, *ELP2;
+  const uint16_t* X;          // [T, H]
+  const float* W;             // [T, K] routing weights
+  __nv_bfloat16* act;         // [S, I] scratch
+  int* cnt;                   // [S] finished pairs per slot, then [T] finished tiles per token (zero between calls)
+  __nv_bfloat16* out;         // [T, H]
+  int T, K, H, I, nexp, nA;
+};
+
+struct RecB { uint4 c0, c1, c2; uint32_t e; int lo, hi; };
+
+__device__ __forceinline__ void load_recb(RecB& f, const uint8_t* T, const int* EO, int tile, int G, int lane, int NG) {
+  const size_t tg = (size_t)tile * NG + G;
+  const uint8_t* base = T + tg * 1552;
+  f.c0 = ldw(base + lane * 16);
+  f.c1 = ldw(base + 512 + lane * 16);
+  f.c2 = ldw(base + 1024 + lane * 16);
+  f.e = __ldg((const uint16_t*)(base + 1536) + (lane >> 2));
+  f.lo = __ldg(EO + tg);
+  f.hi = __ldg(EO + tg + 1);
+}
+
+__device__ __forceinline__ int ld_acquire(const int* p) {
+  int v;
+  asm volatile("ld.acquire.gpu.global.s32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+  return v;
+}
+
+template <typename IT>
+__device__ __forceinline__ long long clamp_id(const IT* ids, int s, int nexp) {
+  long long e = (long long)ids[s];
+  return e < 0 ? 0 : (e >= nexp ? nexp - 1 : e);
+}
+
+__device__ __forceinline__ uint32_t silu_mul2(uint32_t gp, uint32_t up) {   // silu_and_mul on a bf16 pair
+  const float2 gf = __bfloat1622float2(*(const __nv_bfloat162*)&gp), uf = __bfloat1622float2(*(const __nv_bfloat162*)&up);
+  const float s0 = __bfloat162float(__float2bfloat16_rn(gf.x / (1.0f + expf(-gf.x))));
+  const float s1 = __bfloat162float(__float2bfloat16_rn(gf.y / (1.0f + expf(-gf.y))));
+  const __nv_bfloat162 r = __floats2bfloat162_rn(s0 * uf.x, s1 * uf.y);
+  return *(const uint32_t*)&r;
+}
+
+template <int PF, typename IT>
+__global__ void __launch_bounds__(256, 2) mfd_kernel(MFD p, const IT* ids) {
+  __shared__ float red[8][16];
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
+  const int g = lane >> 2, t = lane & 3;
+  const int MT13 = 2 * p.I / 16;                              // 16-row tiles of one slot's gate (first half) and up rows
+  if ((int)blockIdx.x < p.nA) {                               // ---- phase A: one 16-row tile of one slot, 8 warps split K
+    const int s = blockIdx.x / MT13, tile = blockIdx.x % MT13;
+    const int NG = p.H / 64, G0 = NG * warp / 8, G1 = NG * (warp + 1) / 8;
+    const long long e = clamp_id(ids, s, p.nexp);
+    const uint8_t* T = (const uint8_t*)p.TP13[e];
+    const int* EO = (const int*)p.EOP13[e];
+    const uint32_t* EL = (const uint32_t*)p.ELP13[e];
+    const uint16_t* xr[1] = {(g == 0) ? p.X + (size_t)(s / p.K) * p.H : nullptr};
+    float c[4] = {0.f, 0.f, 0.f, 0.f};
+    F7<1> f[PF];
+#pragma unroll
+    for (int i = 0; i < PF; ++i)
+      if (G0 + i < G1) load_fg<1>(f[i], T, EO, xr, tile, G0 + i, lane, NG);
+    for (int G = G0; G < G1; G += PF) {
+#pragma unroll
+      for (int i = 0; i < PF; ++i) {
+        if (G + i < G1) {
+          const uint32_t E0 = (f[i].e & 0xFFu) * 0x01010101u, E1 = ((f[i].e >> 8) & 0xFFu) * 0x01010101u;
+#pragma unroll
+          for (int st = 0; st < 4; ++st) {
+            uint32_t A[4];
+            dec_step5(f[i].c0, f[i].c1, f[i].c2, E0, E1, st, A);
+            if (f[i].lo < f[i].hi) patch_regs(EL, f[i].lo, f[i].hi, lane, st, A);
+            mma16816(c, A, f[i].x[0][2 * st], f[i].x[0][2 * st + 1]);
+          }
+          if (G + i + PF < G1) load_fg<1>(f[i], T, EO, xr, tile, G + i + PF, lane, NG);
+        }
+      }
+    }
+    if (t == 0) { red[warp][g] = c[0]; red[warp][g + 8] = c[2]; }   // column 0 = this slot's input row
+    __syncthreads();
+    if (tid < 16) {
+      float sum = 0.f;
+#pragma unroll
+      for (int k = 0; k < 8; ++k) sum += red[k][tid];
+      p.act[(size_t)s * 2 * p.I + tile * 16 + tid] = __float2bfloat16_rn(sum);   // h[s] (BF16, as the unfused path)
+      __threadfence();
+    }
+    __syncthreads();
+    if (tid == 0) atomicAdd(p.cnt + s, 1);
+    return;
+  }
+  // ---- phase B: one 16-row tile of the down projection of one token, all k experts; silu(gate) * up on load
+  const int b = blockIdx.x - p.nA, MT2 = p.H / 16;
+  const int tk = b / MT2, r = b % MT2;
+  const int S = p.T * p.K, NG2 = p.I / 64;
+  const int j = warp;
+  float c[4] = {0.f, 0.f, 0.f, 0.f};
+  if (j < p.K) {
+    const int s = tk * p.K + j;
+    const long long e = clamp_id(ids, s, p.nexp);
+    const uint8_t* T = (const uint8_t*)p.TP2[e];
+    const int* EO = (const int*)p.EOP2[e];
+    const uint32_t* EL = (const uint32_t*)p.ELP2[e];
+    RecB rb[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+      if (i < NG2) load_recb(rb[i], T, EO, r, i, lane, NG2);   // the weights do not wait for phase A
+    if (lane == 0)
+      while (ld_acquire(p.cnt + s) < MT13) __nanosleep(32);
+    __syncwarp();
+    const uint32_t* hg = (const uint32_t*)(p.act + (size_t)s * 2 * p.I);
+    const uint32_t* hu = hg + p.I / 2;
+    for (int G0 = 0; G0 < NG2; G0 += 4) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int G = G0 + i;
+        if (G < NG2) {
+          if (G0 > 0) load_recb(rb[i], T, EO, r, G, lane, NG2);
+          uint32_t xv[8];
+#pragma unroll
+          for (int st = 0; st < 4; ++st) {
+            const int o = G * 32 + t + 8 * st;                    // uint32 index: bf16 column G*64 + 2t + 16 st
+            xv[2 * st] = (g == 0) ? silu_mul2(__ldcg(hg + o), __ldcg(hu + o)) : 0u;
+            xv[2 * st + 1] = (g == 0) ? silu_mul2(__ldcg(hg + o + 4), __ldcg(hu + o + 4)) : 0u;
+          }
+          const uint32_t E0 = (rb[i].e & 0xFFu) * 0x01010101u, E1 = ((rb[i].e >> 8) & 0xFFu) * 0x01010101u;
+#pragma unroll
+          for (int st = 0; st < 4; ++st) {
+            uint32_t A[4];
+            dec_step5(rb[i].c0, rb[i].c1, rb[i].c2, E0, E1, st, A);
+            if (rb[i].lo < rb[i].hi) patch_regs(EL, rb[i].lo, rb[i].hi, lane, st, A);
+            mma16816(c, A, xv[2 * st], xv[2 * st + 1]);
+          }
+        }
+      }
+    }
+    if (t == 0) {                                              // this expert's rows, rounded as Y is in the unfused path
+      red[j][g] = __bfloat162float(__float2bfloat16_rn(c[0]));
+      red[j][g + 8] = __bfloat162float(__float2bfloat16_rn(c[2]));
+    }
+  }
+  __syncthreads();
+  if (tid < 16) {
+    float acc = 0.f;
+    for (int jj = 0; jj < p.K; ++jj) acc += p.W[(size_t)tk * p.K + jj] * red[jj][tid];
+    p.out[(size_t)tk * p.H + r * 16 + tid] = __float2bfloat16_rn(acc);
+  }
+  if (tid == 0) {                                              // the token's last tile resets its counters
+    if (atomicAdd(p.cnt + S + tk, 1) == MT2 - 1) {
+      for (int jj = 0; jj < p.K; ++jj) p.cnt[tk * p.K + jj] = 0;
+      p.cnt[S + tk] = 0;
+    }
+  }
+}
+
+void mfd(torch::Tensor TP13, torch::Tensor EOP13, torch::Tensor ELP13, torch::Tensor TP2, torch::Tensor EOP2,
+         torch::Tensor ELP2, torch::Tensor X, torch::Tensor ids, torch::Tensor W, torch::Tensor act, torch::Tensor cnt,
+         torch::Tensor out, int64_t I) {
+  const c10::cuda::OptionalCUDAGuard guard(X.device());
+  auto i64 = [](const torch::Tensor& v) { return v.is_cuda() && v.scalar_type() == at::kLong && v.is_contiguous(); };
+  const bool ids32 = ids.is_cuda() && ids.scalar_type() == at::kInt && ids.is_contiguous();
+  TORCH_CHECK(i64(TP13) && i64(EOP13) && i64(ELP13) && i64(TP2) && i64(EOP2) && i64(ELP2) &&
+              TP13.numel() == TP2.numel() && EOP13.numel() == TP13.numel() && ELP13.numel() == TP13.numel() &&
+              EOP2.numel() == TP2.numel() && ELP2.numel() == TP2.numel(), "mfd: pointer tables (int64, one size)");
+  TORCH_CHECK(i64(ids) || ids32, "mfd: ids int32 / int64, contiguous");
+  TORCH_CHECK(X.is_cuda() && X.dtype() == torch::kBFloat16 && X.is_contiguous() && X.dim() == 2, "mfd: X");
+  TORCH_CHECK(out.is_cuda() && out.dtype() == torch::kBFloat16 && out.is_contiguous() && out.sizes() == X.sizes(),
+              "mfd: out");
+  TORCH_CHECK(W.is_cuda() && W.scalar_type() == at::kFloat && W.is_contiguous() && W.dim() == 2 &&
+              W.size(0) == X.size(0), "mfd: W float32 [T, k]");
+  const int64_t T = X.size(0), H = X.size(1), K = W.size(1), S = T * K;
+  TORCH_CHECK(ids.numel() == S && K >= 1 && K <= 8, "mfd: ids [T k], k <= 8");
+  TORCH_CHECK(H % 64 == 0 && I % 64 == 0 && I >= 64, "mfd: H and I multiples of 64");
+  TORCH_CHECK(act.is_cuda() && act.dtype() == torch::kBFloat16 && act.numel() >= S * 2 * I, "mfd: h scratch [S, 2I]");
+  TORCH_CHECK(cnt.is_cuda() && cnt.scalar_type() == at::kInt && cnt.numel() >= S + T, "mfd: counters");
+  if (T == 0) return;
+  MFD p;
+  p.TP13 = TP13.data_ptr<int64_t>(); p.EOP13 = EOP13.data_ptr<int64_t>(); p.ELP13 = ELP13.data_ptr<int64_t>();
+  p.TP2 = TP2.data_ptr<int64_t>(); p.EOP2 = EOP2.data_ptr<int64_t>(); p.ELP2 = ELP2.data_ptr<int64_t>();
+  p.X = (const uint16_t*)X.data_ptr<at::BFloat16>(); p.W = W.data_ptr<float>();
+  p.act = (__nv_bfloat16*)act.data_ptr<at::BFloat16>(); p.cnt = cnt.data_ptr<int>();
+  p.out = (__nv_bfloat16*)out.data_ptr<at::BFloat16>();
+  p.T = (int)T; p.K = (int)K; p.H = (int)H; p.I = (int)I; p.nexp = (int)TP13.numel(); p.nA = (int)(S * (2 * I / 16));
+  const int64_t nb = S * (2 * I / 16) + T * (H / 16);
+  TORCH_CHECK(nb < (1ll << 31), "mfd: grid");
+  cudaStream_t st = at::cuda::getCurrentCUDAStream();
+  if (ids32) mfd_kernel<2, int><<<(unsigned)nb, 256, 0, st>>>(p, ids.data_ptr<int>());
+  else mfd_kernel<2, int64_t><<<(unsigned)nb, 256, 0, st>>>(p, ids.data_ptr<int64_t>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// out[t, :] = sum_j w[t, j] * Y[t * K + j, :] (fp32 sum, BF16 out): the routing-weighted sum of the expert outputs
+template <typename WT>
+__device__ __forceinline__ float wval(WT v);
+template <> __device__ __forceinline__ float wval<float>(float v) { return v; }
+template <> __device__ __forceinline__ float wval<__nv_bfloat16>(__nv_bfloat16 v) { return __bfloat162float(v); }
+
+template <typename WT>
+__global__ void __launch_bounds__(256) wsum_kernel(const __nv_bfloat16* Y, const WT* W, __nv_bfloat16* out, int T,
+                                                   int K, int H) {
+  const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  const int H8 = H / 8;
+  if (i >= (long long)T * H8) return;
+  const int t = (int)(i / H8), h = (int)(i % H8) * 8;
+  float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+  for (int j = 0; j < K; ++j) {
+    const float w = wval<WT>(W[(size_t)t * K + j]);
+    const uint4 v = *(const uint4*)(Y + ((size_t)t * K + j) * H + h);
+    const __nv_bfloat162* p = (const __nv_bfloat162*)&v;
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      const float2 f = __bfloat1622float2(p[q]);
+      acc[2 * q] += w * f.x;
+      acc[2 * q + 1] += w * f.y;
+    }
+  }
+  uint4 o;
+  __nv_bfloat162* po = (__nv_bfloat162*)&o;
+#pragma unroll
+  for (int q = 0; q < 4; ++q) po[q] = __floats2bfloat162_rn(acc[2 * q], acc[2 * q + 1]);
+  *(uint4*)(out + (size_t)t * H + h) = o;
+}
+
+void wsum(torch::Tensor Y, torch::Tensor W, torch::Tensor out) {
+  const c10::cuda::OptionalCUDAGuard guard(Y.device());
+  TORCH_CHECK(Y.is_cuda() && Y.dtype() == torch::kBFloat16 && Y.is_contiguous() && Y.dim() == 2, "wsum: Y");
+  TORCH_CHECK(out.is_cuda() && out.dtype() == torch::kBFloat16 && out.is_contiguous() && out.dim() == 2, "wsum: out");
+  TORCH_CHECK(W.is_cuda() && W.is_contiguous() && W.dim() == 2, "wsum: W");
+  const int64_t T = out.size(0), K = W.size(1), Hd = out.size(1);
+  TORCH_CHECK(W.size(0) == T && Y.size(0) == T * K && Y.size(1) == Hd && Hd % 8 == 0, "wsum: shapes");
+  if (T == 0) return;
+  const long long n = T * (Hd / 8);
+  const unsigned grid = (unsigned)((n + 255) / 256);
+  cudaStream_t st = at::cuda::getCurrentCUDAStream();
+  if (W.scalar_type() == at::kFloat)
+    wsum_kernel<float><<<grid, 256, 0, st>>>((const __nv_bfloat16*)Y.data_ptr<at::BFloat16>(), W.data_ptr<float>(),
+                                            (__nv_bfloat16*)out.data_ptr<at::BFloat16>(), (int)T, (int)K, (int)Hd);
+  else if (W.scalar_type() == at::kBFloat16)
+    wsum_kernel<__nv_bfloat16><<<grid, 256, 0, st>>>((const __nv_bfloat16*)Y.data_ptr<at::BFloat16>(),
+                                                     (const __nv_bfloat16*)W.data_ptr<at::BFloat16>(),
+                                                     (__nv_bfloat16*)out.data_ptr<at::BFloat16>(), (int)T, (int)K, (int)Hd);
+  else TORCH_CHECK(false, "wsum: W must be float32 or bfloat16");
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 // ---------------------------------------------------------------------------------------------- dec7

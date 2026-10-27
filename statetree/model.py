@@ -1,4 +1,5 @@
-"""Model-level API: convert a model's linear layers (and embeddings) to state trees, prepare/tune, save and load."""
+"""Model-level API: convert a model's linear layers, MoE experts and embeddings to state trees, prepare/tune, save and
+load."""
 import contextlib
 import fnmatch
 import json
@@ -8,7 +9,9 @@ import time
 import torch
 import torch.nn as nn
 
-from .linear import TreeEmbedding, TreeLinear, TreeSlice
+from .experts import TreeExperts, expert_layout, experts_eligible
+from . import format as F
+from .linear import MAX_ESCAPE_FRACTION, EscapeHeavy, TreeEmbedding, TreeLinear, TreeSlice
 
 FORMAT_NAME = "statetree"
 FORMAT_VERSION = 3                                  # 3: leaf format v2 (format.LEAF_FORMAT); 2 is migrated on load
@@ -43,16 +46,37 @@ def tree_modules(model):
 
 
 @torch.no_grad()
-def convert(model, include=None, exclude=(), fuse=DEFAULT_FUSE, embeddings=True, verify=True, verbose=True):
-    """Store the model's BF16 linear layers (out % 16 == 0, in % 64 == 0) as state trees, in place.
+def _experts_escape_fraction(mod, lay):
+    """largest escape fraction of the up / down projection tensors of a Transformers experts module"""
+    up, is_t, _ = lay
+    worst = 0.0
+    for name in (up, "down_proj"):
+        P = mod._parameters[name]
+        if is_t:                                      # [E, in, out]: the 64-groups run along 'in' of each expert
+            n = sum(F.escape_count(P[e].t().contiguous()) for e in range(P.shape[0]))
+        else:
+            n = F.escape_count(P)
+        worst = max(worst, n / P.numel())
+    return worst
+
+
+def convert(model, include=None, exclude=(), fuse=DEFAULT_FUSE, embeddings=True, experts=True, verify=True,
+            verbose=True, max_escape_fraction=None):
+    """Store the model's BF16 linear layers (out % 16 == 0, in % 64 == 0) and MoE experts as state trees, in place.
 
     fuse: {fused name: part names}. Sibling Linears that read the same input (q/k/v, gate/up) become one TreeLinear
           '<parent>.<fused name>' and the parts become TreeSlice views of its output: one kernel launch instead of
           three (two). None keeps every layer separate.
     embeddings: also store nn.Embedding tables as trees (exact rows decoded on lookup). A table tied to the output
           layer reuses the output layer's tree, so a tied model keeps one compressed copy.
+    experts: also store MoE experts kept as 3-D parameters (Transformers 5 experts modules: gate_up_proj / up_proj and
+          down_proj [E, out, in]) as one TreeLinear per expert matrix (TreeExperts); the BF16 tensors are freed as
+          they are encoded. (Experts held as nn.Linear modules, as in Transformers 4, are linear layers already.)
     include / exclude: module-name patterns (fnmatch, or a bare attribute name such as "lm_head").
     verify: decode every converted matrix and check it is bit-identical to the original weights.
+    max_escape_fraction: matrices (or MoE expert tensors) with more escapes stay BF16, reported as escape-heavy: their
+          tree would be larger and slower than BF16. Default linear.MAX_ESCAPE_FRACTION (1%, env
+          STATETREE_MAX_ESCAPES); LLM weights have ~0.01%.
     A model loaded with an accelerate device map (device_map="auto" across GPUs) is converted in place, each layer on
     its own GPU; layers offloaded to CPU / disk (weights on the meta device) are left in BF16 and reported."""
     t0 = time.perf_counter()
@@ -68,8 +92,32 @@ def convert(model, include=None, exclude=(), fuse=DEFAULT_FUSE, embeddings=True,
     for name, mod in model.named_modules():
         if isinstance(mod, nn.Linear) and wanted(name):
             (todo.add(name) if _eligible(mod) else skipped.append(name))
-    st = dict(before=0, after=0, layers=0, fused=0, emb=0)
+    st = dict(before=0, after=0, layers=0, fused=0, emb=0, moe=0, moe_mats=0, heavy=0)
     new_out = None
+    mef = MAX_ESCAPE_FRACTION if max_escape_fraction is None else max_escape_fraction
+
+    # 0) MoE experts held as 3-D parameters: one tree per expert matrix, each BF16 tensor freed once encoded
+    if experts:
+        for name, mod in list(model.named_modules()):
+            lay = expert_layout(mod)
+            if lay is None or not wanted(name):
+                continue
+            if not experts_eligible(mod, lay):
+                skipped.append(name)
+                continue
+            frac = _experts_escape_fraction(mod, lay)
+            if frac > mef:
+                skipped.append(f"{name} (escape-heavy: {frac:.2%})")
+                st["heavy"] += 1
+                continue
+            st["before"] += sum(2 * t.numel() for k, t in mod._parameters.items() if t is not None and k in
+                                (lay[0], "down_proj", lay[0] + "_bias", "down_proj_bias"))
+            te = TreeExperts.from_experts(mod, verify=verify)
+            parent, attr = _parent(model, name)
+            setattr(parent, attr, te)
+            st["after"] += te.storage_bytes()
+            st["moe"] += 1
+            st["moe_mats"] += 2 * te.num_experts
 
     # 1) fused groups of siblings
     for pname, parent in list(model.named_modules()):
@@ -83,7 +131,11 @@ def convert(model, include=None, exclude=(), fuse=DEFAULT_FUSE, embeddings=True,
                 continue
             W = torch.cat([lin.weight for lin in lins], 0)
             b = torch.cat([lin.bias for lin in lins], 0) if all(hb) else None
-            tl = TreeLinear.from_weight(W, b, verify=verify)
+            try:
+                tl = TreeLinear.from_weight(W, b, verify=verify, max_escape_fraction=mef)
+            except EscapeHeavy:                      # the parts are tried one by one below
+                del W
+                continue
             del W
             setattr(parent, fname, tl)
             start = 0
@@ -105,7 +157,12 @@ def convert(model, include=None, exclude=(), fuse=DEFAULT_FUSE, embeddings=True,
     for name in sorted(todo):
         parent, attr = _parent(model, name)
         lin = getattr(parent, attr)
-        tl = TreeLinear.from_linear(lin, verify=verify)
+        try:
+            tl = TreeLinear.from_linear(lin, verify=verify, max_escape_fraction=mef)
+        except EscapeHeavy as e:
+            skipped.append(f"{name} (escape-heavy: {e})")
+            st["heavy"] += 1
+            continue
         setattr(parent, attr, tl)
         rec = slices.pop(id(lin), None)
         if rec is not None and rec[0] is lin:
@@ -129,6 +186,10 @@ def convert(model, include=None, exclude=(), fuse=DEFAULT_FUSE, embeddings=True,
             w = mod.weight
             if w.dtype != torch.bfloat16 or w.device.type == "meta" or mod.embedding_dim % 64 or mod.num_embeddings % 16:
                 continue
+            if F.escape_count(w) > mef * w.numel():
+                skipped.append(f"{name} (escape-heavy)")
+                st["heavy"] += 1
+                continue
             if mod is in_emb and tied:
                 if new_out is None:
                     continue                     # the output layer stayed BF16: keep sharing its table
@@ -140,12 +201,17 @@ def convert(model, include=None, exclude=(), fuse=DEFAULT_FUSE, embeddings=True,
             setattr(parent, attr, te)
             st["before"] += 2 * w.numel()
             st["emb"] += 1
+    import gc
+    gc.collect()                                 # the replaced modules sit in reference cycles (hooks): free them now
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     if verbose:
-        print(f"statetree: {st['layers']} linear layers ({st['fused']} fused groups) and {st['emb']} embeddings in "
+        print(f"statetree: {st['layers']} linear layers ({st['fused']} fused groups), "
+              + (f"{st['moe']} MoE expert blocks ({st['moe_mats']} expert matrices), " if st['moe'] else "")
+              + f"{st['emb']} embeddings in "
               f"{time.perf_counter() - t0:.1f}s: {st['before'] / 2**30:.3f} GiB -> {st['after'] / 2**30:.3f} GiB"
-              + (f", skipped {len(skipped)} (not bf16, shape, or offloaded by a device map)" if skipped else "")
+              + (f", skipped {len(skipped)} (not bf16, shape, or offloaded by a device map"
+                 + (f"; {st['heavy']} escape-heavy, kept BF16" if st["heavy"] else "") + ")" if skipped else "")
               + (", all bit-exact" if verify else ""))
     return model
 
@@ -165,7 +231,8 @@ def prepare(model, batch_sizes=(1,), verbose=False):
             bk = bucket_of(B)
             t0 = time.perf_counter()
             if bk != BIG and _autotune_on() and _tuned_get(_state(dev), M, N, bk) is None:
-                mods[0].tune(bk, group=mods)                  # time the candidates across all layers of this shape
+                mods[0].tune(bk, group=mods[:64])             # time the candidates across the layers of this shape (at
+                                                              # most 64: MoE models have thousands of expert matrices)
             for m in mods:
                 m._plan(B)
             if verbose:
@@ -195,8 +262,9 @@ def size_report(model):
 # ----------------------------------------------------------------------------------------- save / load
 def _structure(model):
     names = {id(m): n for n, m in tree_modules(model)}
+    experts = {n: m.spec() for n, m in model.named_modules() if isinstance(m, TreeExperts)}
     modules = {n: dict(in_features=m.in_features, out_features=m.out_features, bias=m.bias is not None)
-               for n, m in tree_modules(model)}
+               for n, m in tree_modules(model) if n.rsplit(".", 2)[0] not in experts}     # expert trees: in 'experts'
     fused, embs = {}, {}
     for n, m in model.named_modules():
         if isinstance(m, TreeSlice):
@@ -204,7 +272,7 @@ def _structure(model):
         elif isinstance(m, TreeEmbedding):
             embs[n] = dict(num_embeddings=m.num_embeddings, embedding_dim=m.embedding_dim,
                            source=None if m.table is not None else names[id(m.source)])
-    return modules, fused, embs
+    return modules, fused, embs, experts
 
 
 def save_pretrained(model, path, tokenizer=None):
@@ -222,9 +290,9 @@ def save_pretrained(model, path, tokenizer=None):
         if key is not None:
             first[key] = k
         tensors[k] = v.detach().contiguous()
-    modules, fused, embs = _structure(model)
+    modules, fused, embs, experts = _structure(model)
     info = dict(format=FORMAT_NAME, version=FORMAT_VERSION, modules=modules, fused=fused, embeddings=embs,
-                aliases=aliases, dtype="bfloat16", architecture=type(model).__name__)
+                experts=experts, aliases=aliases, dtype="bfloat16", architecture=type(model).__name__)
     save_file(tensors, os.path.join(path, WEIGHTS_NAME), metadata={"format": "pt", FORMAT_NAME: str(FORMAT_VERSION)})
     with open(os.path.join(path, INFO_NAME), "w") as fh:
         json.dump(info, fh, indent=1)
@@ -315,14 +383,21 @@ def load_pretrained(path, device=None, device_map="auto", max_memory=None, model
         info = json.load(fh)
     if info.get("format") != FORMAT_NAME:
         raise ValueError(f"{path}: not a statetree checkpoint")
+    import transformers
     from transformers import AutoConfig, AutoModelForCausalLM
     config = AutoConfig.from_pretrained(path, **config_kwargs)
-    cls = model_cls or AutoModelForCausalLM
+    # the class that was saved (e.g. a multimodal ...ForConditionalGeneration, whose module names differ from the
+    # text-only ...ForCausalLM that AutoModelForCausalLM builds), else AutoModelForCausalLM
+    cls = model_cls or getattr(transformers, str(info.get("architecture", "")), None) or AutoModelForCausalLM
+    make = getattr(cls, "from_config", None) or cls._from_config     # Auto* classes / concrete model classes
     with _empty_weights():
         try:
-            model = cls.from_config(config, torch_dtype=torch.bfloat16)
-        except TypeError:
-            model = cls.from_config(config, dtype=torch.bfloat16)
+            model = make(config, dtype=torch.bfloat16)
+        except TypeError:                                               # transformers 4.x
+            model = make(config, torch_dtype=torch.bfloat16)
+    for name, spec in info.get("experts", {}).items():   # MoE experts: TreeExperts skeletons in place of the 3-D params
+        parent, attr = _parent(model, name)
+        setattr(parent, attr, TreeExperts.skeleton(getattr(parent, attr), spec))
     embs = info.get("embeddings", {})
     for name, e in embs.items():                     # embeddings first: an owned table is a TreeLinear inside them
         parent, attr = _parent(model, name)

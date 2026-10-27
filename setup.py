@@ -11,7 +11,8 @@ if os.environ.get("STATETREE_NO_EXT", "0") != "1":
     flags = {"cxx": ["-O3", "-std=c++17"], "nvcc": ["-O3", "-std=c++17"]}
     ext_modules = [
         CUDAExtension("statetree._C",                                        # weight kernels (mv, tm, tt, dec, rows)
-                      ["statetree/csrc/kernels.cu", "statetree/csrc/tt.cu", "statetree/csrc/bindings.cpp"],
+                      ["statetree/csrc/kernels.cu", "statetree/csrc/tt.cu", "statetree/csrc/gtt.cu",
+                       "statetree/csrc/bindings.cpp"],
                       extra_compile_args=flags),
         CUDAExtension("statetree._kv", ["statetree/csrc/kvcache.cu"],      # KV-cache pages + decode attention
                       extra_compile_args=flags),
@@ -20,7 +21,7 @@ if os.environ.get("STATETREE_NO_EXT", "0") != "1":
 
 setup(
     name="statetree",
-    version="0.4.0",
+    version="0.5.2",
     description="Lossless state-tree BF16 weights (12.1 bits/weight) and KV cache (12.5 bits/value) with fused CUDA "
                 "kernels for PyTorch, Hugging Face Transformers and vLLM",
     long_description=open("README.md").read() if os.path.exists("README.md") else "",
@@ -31,7 +32,7 @@ setup(
     package_data={"statetree": ["csrc/*.cu", "csrc/*.cpp"]},
     python_requires=">=3.9",
     install_requires=["torch>=2.1", "safetensors"],
-    extras_require={"hf": ["transformers>=4.43"], "vllm": ["vllm>=0.10"]},
+    extras_require={"hf": ["transformers>=5.20"], "vllm": ["vllm>=0.10"]},      # tested: Transformers 5.21.0, 5.20.2
     entry_points={"vllm.general_plugins": ["statetree = statetree.vllm_plugin:register"]},
     ext_modules=ext_modules,
     cmdclass=cmdclass,
