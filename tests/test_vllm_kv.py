@@ -11,6 +11,8 @@ import os
 import subprocess
 import sys
 
+os.environ.setdefault("STATETREE_MIN_PARAMS", "0")   # the tests expect every linear layer as a tree (small ones too)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODEL = os.environ.get("STATETREE_TEST_KV_MODEL", "Qwen/Qwen3-8B")
 GPU_MEM = float(os.environ.get("STATETREE_TEST_KV_GPU_MEM", "0.85"))

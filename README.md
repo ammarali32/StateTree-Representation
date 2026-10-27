@@ -8,10 +8,11 @@ PS: current version doesn't support MoEs, we are working on it and will be added
 
 Every weight and every cached key / value decodes back to its exact BF16 bits.
 No quantization, no calibration, no accuracy trade-off. Just fewer bytes, and faster tokens.
+Dense and Mixture-of-Experts models, on one GPU or several.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![vLLM](https://img.shields.io/badge/vLLM-0.32-30A2FF)](#with-vllm-two-flags)
-[![Transformers](https://img.shields.io/badge/%F0%9F%A4%97%20Transformers-5.0-FFD21E)](#with--transformers)
+[![Transformers](https://img.shields.io/badge/%F0%9F%A4%97%20Transformers-5.21-FFD21E)](#supported-transformers-versions)
 [![GPU](https://img.shields.io/badge/NVIDIA-sm__80%2B-76B900)](#install)
 [![CUDA](https://img.shields.io/badge/CUDA-12.6-76B900)](#reproducibility-and-hardware)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.7%20%7C%202.13-EE4C2C)](#reproducibility-and-hardware)
@@ -37,6 +38,20 @@ token-for-token identical (256 tokens), replayed at their measured speeds: 3.35 
 | Generation speed, batch 1 | 75.6 tok/s | **97.2 tok/s (1.29×)** |
 | Time to the complete answer | 1.00× | **1.10–1.28× faster** |
 | Weights and cached values | original | **bit-identical** |
+
+| Qwen3.6-35B-A3B (MoE, 256 experts) · 2 × A100-40GB, TP = 2 · vLLM 0.32 | BF16 | **statetree** |
+|---|---:|---:|
+| Weights per GPU | 32.35 GiB | **25.26 GiB** (−22%) |
+| Tokens the KV cache holds (same 0.93 GPU budget) | 199.5K | **596.8K (3.0×)** |
+| Generation speed, batch 1 / 8 / 32 | 166 / 675 / 1671 tok/s | **185 / 762 / 1828 tok/s (1.11× / 1.13× / 1.09×)** |
+| Prefill (16 prompts of 3000 tokens) | 30.8K tok/s | **29.1K tok/s (0.95×)** |
+| Weights | original | **bit-identical** |
+
+<sub>The MoE model nearly fills two 40 GB GPUs in BF16, so the 7.2 GiB per GPU that the experts free go straight to the
+KV cache. Both engines with a warm torch.compile cache, run back to back (see What's new in 0.5.1 for the corrected
+0.5.0 figures).
+Greedy answers are not token-for-token identical: two BF16 runs of this model in vLLM already disagree on 2 of our 4
+chat prompts (after 27 and 50 tokens), and statetree's answers diverge from BF16's at about the same rate.</sub>
 
 LLM generation is memory-bound: every new token re-reads all the weights and the whole KV cache. statetree stores
 both at about **12 bits per value instead of 16**, losslessly, and its kernels read that format directly, decoding
@@ -176,7 +191,8 @@ our top open problem, and contributions are very welcome.
 
 ### Tested environment
 
-Every number in this README was measured on this setup. Pin these versions to reproduce them.
+Every number in this README was measured on this setup (the MoE results on two of these GPUs). Pin these versions to
+reproduce them.
 
 | | Transformers runs | vLLM runs |
 |---|---|---|
@@ -193,6 +209,15 @@ Every number in this README was measured on this setup. Pin these versions to re
 
 Both environments compile statetree's kernels with the same CUDA 12.6 `nvcc`. In the vLLM environment, PyTorch
 brings its own CUDA 12.9 runtime, and CUDA's minor-version compatibility lets the two work together.
+
+### Supported Transformers versions
+
+statetree 0.5 follows the current Transformers interfaces (the cache layers of 5.20+, the 3-D experts modules) and
+needs **Transformers 5.20 or newer**. The full test suite (kernels, KV cache, devices and multi-GPU, MoE) passes with
+**5.21.0, the latest release**, and with 5.20.2, on 2 × A100. Versions before 5.20 are no longer supported. The
+Transformers numbers above were measured with 5.0.0 (statetree 0.4); the kernels behind them are unchanged.
+
+vLLM pins its own Transformers: vLLM 0.32 requires `transformers>=5.16.1,<5.20`, so the vLLM column stays at 5.19.0.
 
 ### Newer GPUs and custom hardware
 
@@ -286,25 +311,13 @@ our vLLM tests, greedy generations, prefix-cache hits and chunk-prefilled long p
 vLLM's BF16 cache; teacher-forced top-1 tokens agree with BF16 at 97.6–99.8% of positions, and the differences fall
 on near-ties. Outputs are bit-identical run to run.
 
----
-
-## What's new in 0.4
-
-- **State-tree KV cache**, lossless, for vLLM (`--kv-representation statetree`: paged blocks, prefix caching,
-  chunked prefill, CUDA graphs) and Transformers (`StateTreeKVCache`), with a decode-attention kernel that beats
-  FlashAttention-2.
-- **Faster prefill**: a fused tensor-core GEMM for 65–1024 tokens per step (vLLM, 256–1024 tokens: 0.64–0.80× of
-  BF16 in 0.3, 0.87× now).
-- **Cheaper weight decode** (new leaf layout); 0.3 checkpoints are migrated on load.
-- Deterministic split-K reductions, and autotuning that no longer keeps its scratch buffers.
-
----
 
 ## Install
 
 Requirements: an NVIDIA GPU with compute capability 8.0 or newer (A100, RTX 30xx/40xx, L4, H100), PyTorch ≥ 2.1 with
-CUDA, a CUDA toolkit (`nvcc`) with the same major version as torch's CUDA, and `safetensors`. `transformers` is needed for `load_pretrained`, the
-Transformers KV cache and the examples.
+CUDA, a CUDA toolkit (`nvcc`) with the same major version as torch's CUDA, and `safetensors`. `transformers` 5.20 or
+newer (tested with 5.21.0, `pip install "statetree[hf]"`) is needed for `load_pretrained`, the Transformers KV cache,
+MoE models and the examples.
 
 ```bash
 pip install wheel ninja
@@ -359,7 +372,8 @@ Offloaded layers keep their trees in CPU memory and cross PCIe at 12 bits per we
 <details>
 <summary><b>API</b></summary>
 
-* `statetree.convert(model, include=None, exclude=(), fuse=DEFAULT_FUSE, embeddings=True, verify=True)`
+* `statetree.convert(model, include=None, exclude=(), fuse=DEFAULT_FUSE, embeddings=True, experts=True, verify=True,
+  max_escape_fraction=None)`: `experts` also converts MoE experts held as 3-D tensors (`statetree.TreeExperts`)
 * `statetree.prepare(model, batch_sizes)`: tunes kernels ahead of time (run before CUDA-graph capture)
 * `statetree.save_pretrained(model, path, tokenizer=None)` / `statetree.load_pretrained(path, ...)`
 * `statetree.size_report(model)`, `TreeLinear.dequantize()` (exact BF16 weight)
@@ -374,7 +388,8 @@ Offloaded layers keep their trees in CPU memory and cross PCIe at 12 bits per we
 * `examples/vllm_response.py`, `examples/hf_response.py`: time to the complete answer and memory, BF16 / state-tree
   weights × BF16 / state-tree KV cache
 * `examples/vllm_tps.py`, `examples/hf_tps.py`: decode throughput, prefill latency and exactness
-* `python -m pytest tests -q`: kernels, KV cache, devices, vLLM (`tests/test_vllm*.py`)
+* `python -m pytest tests -q`: kernels, KV cache, devices, MoE (`tests/test_moe.py`), vLLM (`tests/test_vllm*.py`,
+  MoE in vLLM at TP = 1 and 2: `tests/test_vllm_moe.py`)
 </details>
 
 ---
@@ -384,6 +399,9 @@ Offloaded layers keep their trees in CPU memory and cross PCIe at 12 bits per we
 - [ ] **Prefill at parity with cuBLAS.** 0.4's fused GEMM closed most of the gap (0.87–1.03× in vLLM); the format is
   tensor-core friendly, so parity should be reachable.
 - [x] **State trees for the KV cache** (vLLM paged cache and Transformers, lossless).
+- [x] **Mixture-of-Experts models** (Transformers and vLLM).
+- [x] **MoE prefill kernel:** a grouped tree GEMM (0.5.1).
+- [ ] **MoE prefill at parity** at 4096+ tokens per step.
 - [ ] **State trees for activations.**
 - [ ] **LoRA fine-tuning on state-tree models.** Train adapters on top of the frozen, compressed base.
 - [ ] **State trees for convolution layers.**
@@ -402,6 +420,13 @@ Pick one, open an issue, and let's talk. 🙌
   caching or chunked prefill, the cached part of a prompt is decoded into a temporary BF16 buffer for prefill
   attention, outside vLLM's memory budget.
 * Small matrices at batch 16–64, and tensor parallelism on small models, gain little from the weights alone.
+* MoE: decode is 1.05–1.13× of BF16 on Qwen3.6-35B-A3B in vLLM (batch 1–32), and the KV cache holds 3× the tokens.
+  Prefill is 0.95× of BF16 end to end: the expert layers are faster than vLLM's BF16 Triton kernel up to 2048 tokens per step and slower
+  beyond (one full layer: 0.86× / 0.79× at 4096 / 8192 tokens). Which kernel runs depends on the size of the step,
+  so a token's output can differ in the last bits with the batch it was scheduled in (as with most fused kernels).
+  Routers stay BF16 in Transformers. Experts modules without the Transformers 5 layout flags are left alone. In
+  vLLM, expert parallelism, biased or non-SiLU experts use the decode-to-BF16 path at every batch size, as do experts
+  whose matrices are not whole 128-row blocks above 64 pairs per expert.
 
 ## A note on the kernels
 
@@ -412,7 +437,7 @@ help.
 
 ## Citation
 
-statetree implements one application of our weight-representation <a href="https://arxiv.org/abs/2610.31931">paper</a>:
+statetree implements one application of our weight-representation <a href="https://huggingface.co/papers/2610.31931">paper</a>:
 
 ```bibtex
 @article{ali2026every,

@@ -89,6 +89,31 @@ def test_one_hot_exact():
                                .view(torch.int16)), (path, prm)
 
 
+def test_one_hot_exact_mv():
+    """the matrix-vector paths (batch <= 32, every mv configuration) reproduce columns of W bit-exactly, escapes
+    included: the fixture's outliers and zeros, and a matrix with a fifth of its weights escaping (hundreds of entries
+    per record: the per-warp escape image)"""
+    M, N = 256, 1024
+    st = _state(torch.device(DEV))
+    W1 = weights(M, N, 11)
+    W2 = weights(M, N, 12)
+    W2[torch.rand(M, N, device=DEV) < 0.2] *= 1e-6
+    for W in (W1, W2):
+        tl = TreeLinear.from_linear(_lin(W))
+        for B in (1, 8, 32):
+            x = torch.zeros(B, N, device=DEV, dtype=torch.bfloat16)
+            cols = (torch.arange(B, device=DEV) * 37 + 5) % N
+            x[torch.arange(B), cols] = 1
+            want = W[:, cols].t().contiguous()
+            n = 0
+            for path, prm in candidates(M, N, B, st):
+                if path == "mv" and tl._valid(path, prm, B):
+                    y = torch.empty(B, M, device=DEV, dtype=torch.bfloat16)
+                    tl._run(x, y, (path, prm))
+                    assert torch.equal(y, want), (B, prm)
+                    n += 1
+            assert n > 0, B
+
 def test_convert_save_load():
     torch.manual_seed(0)
     net = nn.Sequential(nn.Linear(256, 512, bias=True), nn.GELU(), nn.Linear(512, 256), nn.Linear(256, 10)) \

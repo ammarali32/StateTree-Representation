@@ -9,8 +9,9 @@ attention straight over the pages; prefill runs the model's SDPA attention on th
     cache = StateTreeKVCache(model.config, batch_size=B, max_cache_len=prompt + new)
     model.generate(input_ids, attention_mask=mask, past_key_values=cache, max_new_tokens=new)
 
-The cache is CUDA-graph safe for decode steps (positions come from the cache_position tensor, buffers are static), so
-it also works with statetree.bench.StaticGraphDecoder(cache_factory=...). Left padding is supported (each sequence's
+The cache is CUDA-graph safe for decode steps (positions come from a GPU-side token count, as in transformers'
+StaticCache, or from cache_position when a model passes it; buffers are static), so it also works with
+statetree.bench.StaticGraphDecoder. Written for the Transformers 5.20+ cache interface (tested with 5.20.2 and 5.21.0). Left padding is supported (each sequence's
 first valid position is taken from the prefill attention mask).
 """
 import threading
@@ -40,7 +41,7 @@ class StateTreeKVLayer(CacheLayerMixin):
         self.cache, self.layer_idx = cache, layer_idx
         self._len = 0                               # tokens stored (host count: eager generate / prefill path)
         self.max_cache_len = cache.max_len
-        self.max_batch_size = cache.batch_size
+        self.max_batch_size = cache.alloc_batch
 
     def lazy_initialization(self, key_states, value_states):
         c = self.cache
@@ -50,19 +51,23 @@ class StateTreeKVLayer(CacheLayerMixin):
         c._ensure(B, H, key_states.device)
         self.dtype, self.device = key_states.dtype, key_states.device
         self.max_batch_size, self.num_heads = c.Bmax, H
+        self.batch_size = c.Bmax                    # read by Cache.batch_size (a property since Transformers 5.20)
         self.pages = torch.empty(c.Bmax * c.max_pages, H, 2, 2, RKV, dtype=torch.uint8, device=self.device)
         self.pool = torch.zeros(c.pool_blocks, 16, dtype=torch.int32, device=self.device)
         self.pcnt = torch.zeros(2, dtype=torch.int32, device=self.device)
+        self.cum = torch.zeros((), dtype=torch.long, device=self.device)   # tokens stored, GPU side (CUDA graphs)
         self.is_initialized = True
 
-    def update(self, key_states, value_states, cache_kwargs=None):
+    def update(self, key_states, value_states, *args, **kwargs):
+        cache_kwargs = args[0] if args else kwargs.get("cache_kwargs")
         if not self.is_initialized:
             self.lazy_initialization(key_states, value_states)
         c = self.cache
         B, H, T, D = key_states.shape
-        cp = cache_kwargs.get("cache_position") if cache_kwargs else None
-        if cp is None:
-            cp = torch.arange(self._len, self._len + T, device=self.device)
+        cp = cache_kwargs.get("cache_position") if isinstance(cache_kwargs, dict) else None
+        if cp is None:                              # Transformers >= 5.20 passes no positions: the GPU-side count
+            cp = torch.arange(T, device=self.device) + self.cum
+        self.cum.copy_(cp[-1] + 1)
         slots = (c.bt64[:B, :][:, cp // PAGE] * PAGE + (cp % PAGE)).reshape(-1)
         K = key_states.transpose(1, 2).reshape(B * T, H, D)
         V = value_states.transpose(1, 2).reshape(B * T, H, D)
@@ -96,19 +101,23 @@ class StateTreeKVLayer(CacheLayerMixin):
         v = Vd[blk, (pos % PAGE)[None].expand(B, n)]
         return k.transpose(1, 2), v.transpose(1, 2)
 
-    def get_mask_sizes(self, cache_position):
-        return self._len + cache_position.shape[0], 0
+    def get_mask_sizes(self, query_length):
+        q = query_length.shape[0] if isinstance(query_length, torch.Tensor) else int(query_length)
+        return self._len + q, 0
 
     def get_seq_length(self):
-        return self._len
+        return self.cum if self.is_initialized else 0      # a GPU tensor, like StaticCache: positions stay graph-safe
 
-    def get_max_cache_shape(self):
+    def get_max_length(self):
         return self.max_cache_len
+
+    get_max_cache_shape = get_max_length
 
     def reset(self):
         self._len = 0
         if self.is_initialized:
             self.pcnt.zero_()
+            self.cum.zero_()
         self.cache.starts_set = False
 
     def check(self):
@@ -134,7 +143,7 @@ class StateTreeKVCache(Cache):
         self.num_kv_heads = getattr(tc, "num_key_value_heads", None) or tc.num_attention_heads
         self.max_len = int(max_cache_len)
         self.max_pages = (self.max_len + PAGE - 1) // PAGE
-        self.batch_size = batch_size
+        self.alloc_batch = batch_size               # (Cache.batch_size is a read-only property in Transformers >= 5.20)
         self.pool_blocks = pool_blocks
         self.starts_set = False
         self._ready = False
@@ -144,7 +153,7 @@ class StateTreeKVCache(Cache):
         if self._ready:
             assert B <= self.Bmax, "StateTreeKVCache: batch larger than allocated"
             return
-        self.Bmax = max(B, self.batch_size or 0)
+        self.Bmax = max(B, self.alloc_batch or 0)
         Bm = self.Bmax
         self.bt64 = torch.arange(Bm * self.max_pages, device=dev).view(Bm, self.max_pages)      # page ids
         self.bt32 = self.bt64.to(torch.int32)

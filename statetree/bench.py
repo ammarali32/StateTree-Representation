@@ -184,10 +184,13 @@ class StaticGraphDecoder:
     supports StaticCache, including hybrid linear-attention models (Qwen3.5, Qwen3-Next)."""
 
     def __init__(self, model, batch, max_len, graph=True):
+        import inspect
         from transformers import StaticCache
         dev = _device(model)
         self.model, self.B, self.S, self.use_graph = model, batch, max_len, graph
         self.cache = StaticCache(config=model.config, max_cache_len=max_len)
+        # Transformers >= 5.20 take positions from the cache's GPU-side token count and no longer accept cache_position
+        self._pass_cp = "cache_position" in inspect.signature(model.forward).parameters
         self.tok = torch.zeros(batch, 1, dtype=torch.long, device=dev)
         self.pos = torch.zeros(1, dtype=torch.long, device=dev)
         self.cnt = torch.zeros(1, dtype=torch.long, device=dev)
@@ -196,8 +199,20 @@ class StaticGraphDecoder:
         self._used = False
 
     def _fwd(self, ids, cache_position):
-        return self.model(input_ids=ids, past_key_values=self.cache, cache_position=cache_position, use_cache=True,
-                          logits_to_keep=1).logits
+        kw = dict(cache_position=cache_position) if self._pass_cp else {}
+        return self.model(input_ids=ids, past_key_values=self.cache, use_cache=True, logits_to_keep=1, **kw).logits
+
+    def capture(self):
+        """DecodeRunner.capture, then the cache's GPU-side token counts are put back to where the warm-up steps found
+        them, so replays continue right after the prefill (recurrent states of linear-attention layers cannot be put
+        back: for hybrid models, prefill again after capture, as generate() does)."""
+        layers = getattr(self.cache, "layers", [])
+        saved = [(t, t.clone()) for lay in layers for n in ("cumulative_length", "cum")
+                 if isinstance(t := getattr(lay, n, None), torch.Tensor)]
+        DecodeRunner.capture(self)
+        for t, v in saved:
+            t.copy_(v)
+        torch.cuda.synchronize()
 
     @torch.no_grad()
     def prefill(self, ids):
@@ -221,7 +236,6 @@ class StaticGraphDecoder:
         self.pos += 1
         self.cnt += 1
 
-    capture = DecodeRunner.capture
     generate = DecodeRunner.generate
 
 

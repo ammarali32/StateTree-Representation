@@ -10,6 +10,8 @@ import os
 import subprocess
 import sys
 
+os.environ.setdefault("STATETREE_MIN_PARAMS", "0")   # the tests expect every linear layer as a tree (small ones too)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "examples"))
 MODEL = os.environ.get("STATETREE_TEST_MODEL", "unsloth/Llama-3.2-1B")
