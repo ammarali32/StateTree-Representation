@@ -2,8 +2,6 @@
 
 # statetree 🌳
 
-PS: current version doesn't support MoEs, we are working on it and will be added ASAP.
-
 **Lossless compression of LLM weights *and* KV cache, with fused CUDA kernels for vLLM and 🤗 Transformers.**
 
 Every weight and every cached key / value decodes back to its exact BF16 bits.
