@@ -2,6 +2,8 @@
 
 # statetree 🌳
 
+PS: current version doesn't support MoEs, we are working on it and will be added ASAP.
+
 **Lossless compression of LLM weights *and* KV cache, with fused CUDA kernels for vLLM and 🤗 Transformers.**
 
 Every weight and every cached key / value decodes back to its exact BF16 bits.
@@ -438,11 +440,11 @@ help.
 statetree implements one application of our weight-representation <a href="https://huggingface.co/papers/2610.31931">paper</a>:
 
 ```bibtex
-@article{ali2026twig,
+@article{ali2026every,
   title   = {Every Weight Is a Path of Shared Discrete Decisions},
-  author  = {Ali, Ammar and Lefkimmiatis, Stamatis},
-  journal = {arXiv preprint},
-  year    = {2026}
+  author  = {Ammar Ali and Stamatis Lefkimmiatis},
+  year    = {2026},
+  journal = {arXiv preprint arXiv: 2610.31931}
 }
 ```
 
