@@ -2,6 +2,12 @@
 
 Forward paths (chosen per (shape, batch bucket), autotuned on first use or by 'statetree.prepare'):
   mv   batch <= 32     warp-per-tile matrix-vector kernel, decode in registers, split-K merged by the last CTA
+  mvs  batch <= 32     sm_90+: mv with the activations staged in shared memory (ldmatrix); bit-identical to mv
+  mvh  batch <= 8      sm_90+: mv with a lean inner loop (staged activations, per-32-record escape masks); bit-identical
+  mvc  batch <= 8      sm_90+: sweep over the records in memory order (each CTA reads consecutive records; DRAM-friendly)
+  mvt  batch <= 8      sm_90a: the same sweep with TMA bulk copies into a shared-memory ring (in-flight bytes off registers)
+  th   any batch       sm_90a (H100 / H200): TMA producer warp + 2 wgmma consumer warpgroups, records decoded into the
+                       register A operand, activations from shared memory once per 64 rows; stream-K, deterministic
   tm   batch 2..512    Marlin-style fused decode + mma.sync GEMM, stream-K over (row block, 64-col group) units
   tt   batch 65..1024  one-token-tile GEMM (prefill): 128 rows x TT tokens per tile, each 16 x 64 record decoded once
                        per tile into shared memory; data-parallel rounds + stream-K, or balanced split-K (small layers)
@@ -37,6 +43,7 @@ MAX_ESCAPE_FRACTION = float(os.environ.get("STATETREE_MAX_ESCAPES", "0.01"))
 class EscapeHeavy(ValueError):
     """the matrix has more escapes than max_escape_fraction allows: keep it in BF16"""
 TUNE_VERSION = 4                  # 4: tt stream-K fix (small problems); plans tuned before it are re-tuned
+TUNE_VERSION_SM90 = 10            # sm_90+: 6 mvs, th; 7 mvh; 8 mvc; 9 mvt; 10 timed in CUDA graphs (A100 keeps 4)
 # tt: main-loop cycles per 64-k tile per CTA by (TT, NWT) (A100, whole chip busy): the cost model that ranks tile shapes
 TT_CYC = {(96, 2): 1350, (128, 2): 1630, (160, 2): 1880, (192, 2): 2250, (224, 2): 2640, (256, 2): 2945,
           (128, 4): 1861, (192, 4): 2111, (256, 4): 2745}
@@ -123,11 +130,100 @@ def _mv_cfgs(M, NG):
                         yield WM, WK, GY, PF
 
 
+def _mvs_fits(M, N, B, prm, st):
+    WM, WK, GY, PF = prm
+    return M % (16 * WM) == 0 and ext().mvs_smem(B, N, WM, WK, GY) <= st.smem_max
+
+
+def _mvh_fits(M, N, B, prm, st):
+    WM, WK, GY, PF = prm
+    return B <= 8 and M % (16 * WM) == 0 and ext().mvh_smem(B, N, WM, WK, GY) <= st.smem_max
+
+
+def _mvc_cfgs(M, NG):
+    """(WK, GY, TC, PF) of mvc: WK warps per CTA, GY column splits (merged as mv7), TC tiles per CTA, prefetch depth"""
+    tiles = M // 16
+    for WK in (4, 8):
+        for GY in (1, 2, 3, 4):
+            for TC in (1, 2, 3, 4, 6, 8):
+                if NG % (GY * WK) or tiles % TC or (TC > 1 and GY > 1) or (tiles // TC) * GY < 64:
+                    continue
+                for PF in (2, 4):
+                    yield WK, GY, TC, PF
+
+
+def _mvc_fits(M, N, B, prm, st):
+    WK, GY, TC, PF = prm
+    return (B <= 8 and M % 16 == 0 and (N // 64) % (GY * WK) == 0 and (M // 16) % TC == 0 and (TC == 1 or GY == 1)
+            and ext().mvc_smem(B, N, WK, GY, TC) <= st.smem_max)
+
+
+def _mvt_cfgs(M, N, B, st):
+    """(C, S) of mvt: C CTAs (1-3 per SM, all resident), S ring stages of 8 records; a tile spans at most 4 CTAs"""
+    if B > 8 or M % 16 or N % 512 or not hopper(st) or not th_on(st):
+        return []
+    U, cpt = (M // 16) * (N // 64) // 8, N // 512
+    out = []
+    for k in (1, 2, 3):
+        C = k * st.sms
+        per = U // C
+        if C > U or per < 1 or 1 + -(-(cpt - 1) // per) > 4:
+            continue
+        for S in (2, 4, 8):
+            if k * (ext().mvt_smem(S, B, N) + 1024) <= 233472:
+                out.append((C, S))
+    return out
+
+
+def hopper(st):
+    """sm_90+ (H100, H200 and newer): the Hopper candidates and tuning-table version apply"""
+    return st.cc >= (9, 0)
+
+
+TH_NTOK = (8, 16, 32, 64, 128, 256)
+TH_FLAGS = [0]                                      # th diagnostics (builds with TH_DIAG only): 1 = stream only
+
+
+def th_on(st):
+    """the sm_90a th kernel is built and runs on this GPU (H100 / H200; not A100, not Blackwell)"""
+    if st.th is None:
+        st.th = bool(st.cc[0] == 9 and ext().th_ok())
+    return st.th
+
+
+def _th_cfgs(M, N, B, st):
+    """(ntok, C, R, W) of the th kernel: the smallest token tile holding the batch (and half of it: twice the tiles),
+    128 / 256 above 256 tokens; C CTAs per token tile (one per SM, at most one per unit); R records per warp and unit
+    (2: units of 256 rows, token tiles <= 32); W: 0 = mma.sync (token tiles <= 64), 1 = wgmma (>= 64)"""
+    if M % 128 or N % 64 or not hopper(st) or not th_on(st):
+        return []
+    base = next((n for n in TH_NTOK if n >= B), 256)
+    ntoks = {base} | ({base // 2} if base >= 16 and B > 8 else set()) | ({128} if B > 256 else set())
+    out = []
+    for nt in sorted(ntoks):
+        nTT = -(-B // nt)
+        # W = 2 (the transposed wgmma path) is exact but slower at every measured shape: not ranked
+        for R, W in ((1, 0), (2, 0)) if nt <= 32 else ((1, 0), (1, 1)) if nt == 64 else ((1, 1),):
+            if M % (128 * R):
+                continue
+            U = (M // (128 * R)) * (N // 64)
+            for C in sorted({max(1, min(U, st.sms // nTT)), max(1, min(U, (2 * st.sms) // (3 * nTT)))}):
+                out.append((nt, C, R, W))               # C x token tiles <= SMs: all CTAs resident (stream-K wait)
+    return out
+
+
 def candidates(M, N, B, st):
     NG = N // 64
     out = []
     if B <= 32:
         out += [("mv", c) for c in _mv_cfgs(M, NG)]
+        if hopper(st) and B > 8:                    # mvs loses to mv at batch <= 8 on the H100 (activation loads are cheap)
+            out += [("mvs", c) for c in _mv_cfgs(M, NG) if _mvs_fits(M, N, B, c, st)]
+        if hopper(st) and B <= 8:
+            out += [("mvh", c) for c in _mv_cfgs(M, NG) if _mvh_fits(M, N, B, c, st)]
+            out += [("mvc", c) for c in _mvc_cfgs(M, NG) if _mvc_fits(M, N, B, c, st)]
+            out += [("mvt", c) for c in _mvt_cfgs(M, N, B, st)]
+    out += [("th", c) for c in _th_cfgs(M, N, B, st)]
     if 2 <= B <= 512:
         for cfg in _tm_cfgs(M, B, st.smem_max):
             out += [("tm", (cfg, C)) for C in _grid_options(M, NG, B, cfg, st.sms)]
@@ -149,6 +245,10 @@ def heuristic(M, N, B, st):
         GY = 1
         while GY < 16 and tiles * GY * 2 <= 2 * st.sms and NG >= 2 * GY * WK * 2:
             GY *= 2
+        if hopper(st) and B > 8 and _mvs_fits(M, N, B, (1, WK, GY, 2), st):
+            out.append(("mvs", (1, WK, GY, 2)))
+        if hopper(st) and B <= 8 and _mvh_fits(M, N, B, (1, WK, GY, 2), st):
+            out.append(("mvh", (1, WK, GY, 2)))
         out.append(("mv", (1, WK, GY, 2)))
     if 2 <= B <= 512:
         pref = (1, 3, 9) if B <= 16 else (3, 9) if B <= 32 else (5, 9) if B <= 64 else (9, 10) if B <= 128 \
@@ -165,6 +265,7 @@ def heuristic(M, N, B, st):
 
 # ----------------------------------------------------------------------------------------- large-batch prefetch
 _PF_OFF = [0]                                      # > 0 while tuning: no side-stream work
+_CAPTURE_WARNED = []                               # the first failed tuning capture is reported once
 
 
 def _prefetch_on():
@@ -273,6 +374,8 @@ class _DevState:
         self.dev = dev
         p = torch.cuda.get_device_properties(dev)
         self.name, self.sms = p.name, p.multi_processor_count
+        self.cc = (p.major, p.minor)
+        self.th = None                           # th kernel available (probed on first use)
         self.l2 = int(getattr(p, "L2_cache_size", 40 << 20))
         self.smem_max = int(getattr(p, "shared_memory_per_block_optin", 99 << 10))
         self.cnt = torch.zeros(1 << 16, dtype=torch.int32, device=dev)     # semaphores, kernels reset them to 0
@@ -374,7 +477,7 @@ def _cache_path():
 
 
 def _tkey(st, M, N, bk, tag=""):
-    return f"v{TUNE_VERSION}{tag}|{st.name}|{M}|{N}|{bk}"
+    return f"v{TUNE_VERSION_SM90 if hopper(st) else TUNE_VERSION}{tag}|{st.name}|{M}|{N}|{bk}"
 
 
 def _tuned_get(st, M, N, bk, tag=""):
@@ -600,6 +703,13 @@ class TreeLinear(nn.Module):
                                           self.esc_bits)
         return self._rt[k]
 
+    def _esc_chunks(self):
+        k = (self.tree.device, "chunks")
+        if k not in self._rt:
+            self._rt[k] = F.escape_chunks(self.out_features, self.in_features, self.esc_rows, self.esc_cols,
+                                          self.esc_bits)
+        return self._rt[k]
+
     def _tt_tables(self):
         """tt escape tables, per 128-row block rb: koff[rb, kt] = start of k-tile kt's escapes (KS ints per row) and
         ent[rb, :CAP] = bf16 bits << 16 | record << 10 | row << 6 | col, sorted by k-tile"""
@@ -619,6 +729,26 @@ class TreeLinear(nn.Module):
             return True
         if path == "mv":
             return B <= 32 and M % (16 * prm[0]) == 0
+        if path == "mvs":
+            return B <= 32 and _mvs_fits(M, N, B, prm, _state(self.tree.device))
+        if path == "mvh":
+            return B <= 8 and _mvh_fits(M, N, B, prm, _state(self.tree.device))
+        if path == "mvc":
+            return B <= 8 and _mvc_fits(M, N, B, prm, _state(self.tree.device))
+        if path == "mvt":
+            if prm not in _mvt_cfgs(M, N, B, _state(self.tree.device)):
+                return False
+            self._esc_chunks()                      # build the side table now (not inside a CUDA-graph capture)
+            return True
+        if path == "th":
+            st = _state(self.tree.device)
+            nt, C, R, W = prm
+            if (M % (128 * R) or not th_on(st) or C > (M // (128 * R)) * (N // 64) or (R == 2 and nt > 32)
+                    or C * -(-B // nt) > st.sms
+                    or not ((W == 0 and nt <= 64) or (W in (1, 2) and nt >= 64 * W and R == 1))):
+                return False
+            self._esc_blocks(8 * R)                 # build the side table now (not inside a CUDA-graph capture)
+            return True
         if path == "tm":
             RT = tm_geom(prm[0])["RT"]
             if M % (16 * RT):
@@ -703,6 +833,32 @@ class TreeLinear(nn.Module):
             nbc = 8 if B <= 8 else 16 if B <= 16 else 32
             ws = st.get_ws((M // (16 * WM)) * GY * 16 * WM * nbc if GY > 1 else 1)
             E.mv(self.tree, eo, el, x, y, ws, st.cnt, WM, WK, GY, PF)
+        elif path == "mvs":
+            WM, WK, GY, PF = prm
+            eo, el = self._esc_lists()
+            nbc = 8 if B <= 8 else 16 if B <= 16 else 32
+            ws = st.get_ws((M // (16 * WM)) * GY * 16 * WM * nbc if GY > 1 else 1)
+            E.mvs(self.tree, eo, el, x, y, ws, st.cnt, WM, WK, GY, PF)
+        elif path == "mvh":
+            WM, WK, GY, PF = prm
+            eo, el = self._esc_lists()
+            ws = st.get_ws((M // (16 * WM)) * GY * 16 * WM * 8 if GY > 1 else 1)
+            E.mvh(self.tree, eo, el, x, y, ws, st.cnt, WM, WK, GY, PF)
+        elif path == "mvc":
+            WK, GY, TC, PF = prm
+            eo, el = self._esc_lists()
+            ws = st.get_ws((M // 16) * GY * 128 if GY > 1 else 1)
+            E.mvc(self.tree, eo, el, x, y, ws, st.cnt, WK, GY, TC, PF)
+        elif path == "mvt":
+            C, S = prm
+            eb, eou, eall = self._esc_chunks()
+            ws = st.get_ws((M // 16) * 4 * 128)
+            E.mvt(self.tree, eb, eou, eall, x, y, ws, st.cnt, C, S)
+        elif path == "th":
+            nt, C, R, W = prm
+            eb, eou, eall = self._esc_blocks(8 * R)
+            ws = st.get_ws(-(-B // nt) * C * 128 * nt * R)
+            E.th(self.tree, eb, eou, eall, x, y, ws, st.cnt, nt, C, R, W, TH_FLAGS[0])
         elif path == "tm":
             cfg, C = prm
             gm = tm_geom(cfg)
@@ -780,6 +936,26 @@ class TreeLinear(nn.Module):
         y = torch.empty(B, M, device=dev, dtype=torch.bfloat16)
         ref = (x.float() @ self.dequantize().float().t())
         scale = ref.norm()
+        # Hopper, decode batches: time candidates inside CUDA graphs, as vLLM serves them (launch gaps, programmatic
+        # dependent launches); the A100 keeps eager timing (its plans are unchanged). If a capture fails (another thread
+        # using CUDA, an unsupported call), every candidate is timed eagerly instead.
+        graphs = hopper(st) and B <= 32 and not _capturing()
+        res, failed = self._time_candidates(group, x, y, ref, scale, B, iters, graphs, verbose)
+        if failed:
+            res, _ = self._time_candidates(group, x, y, ref, scale, B, iters, False, verbose)
+        res.sort(key=lambda r: r[0])
+        ranked = [p for _, p in res[:4]]
+        if verbose and res:
+            print(f"statetree tune {M}x{N} b{bk}: " + ", ".join(f"{p[0]}{p[1]} {t * 1e3:.1f}us" for t, p in res[:3]))
+        _tuned_put(st, M, N, bk, ranked, self.TUNE_TAG)
+        return ranked
+
+    def _time_candidates(self, group, x, y, ref, scale, B, iters, graphs, verbose):
+        """[(ms per layer, plan)] of the valid candidates; graphs: time each inside a CUDA graph of the group (only paths
+        that allocate nothing while running). Returns (results, True) as soon as a capture fails."""
+        M, N = self.out_features, self.in_features
+        st = _state(self.tree.device)
+        dev = self.tree.device
         res = []
         for path, prm in candidates(M, N, B, st):
             if not all(m._valid(path, prm, B) for m in group):
@@ -790,29 +966,50 @@ class TreeLinear(nn.Module):
                 torch.cuda.synchronize(dev)
                 if float((y.float() - ref).norm() / scale) > 1e-2:
                     continue
-                evs = []
-                for i in range(iters + 2):
-                    st.flush()
-                    a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-                    a.record()
-                    for m in group:
-                        m._run(x, y, plan)
-                    b.record()
-                    if i >= 2:
-                        evs.append((a, b))
+                for m in group:                     # grow every buffer the plan needs before any capture
+                    m._run(x, y, plan)
                 torch.cuda.synchronize(dev)
-                ts = sorted(a.elapsed_time(b) for a, b in evs)
-                res.append((ts[len(ts) // 2] / len(group), plan))
-            except RuntimeError as e:                       # e.g. a config the GPU cannot launch
+            except RuntimeError as e:               # e.g. a config the GPU cannot launch
                 if verbose:
                     print("statetree tune: skip", plan, str(e)[:80])
                 torch.cuda.synchronize(dev)
-        res.sort(key=lambda r: r[0])
-        ranked = [p for _, p in res[:4]]
-        if verbose and res:
-            print(f"statetree tune {M}x{N} b{bk}: " + ", ".join(f"{p[0]}{p[1]} {t * 1e3:.1f}us" for t, p in res[:3]))
-        _tuned_put(st, M, N, bk, ranked, self.TUNE_TAG)
-        return ranked
+                continue
+            g = None
+            if graphs and path in ("mv", "mvs", "mvh", "mvc", "mvt", "th", "tm"):
+                try:
+                    g = torch.cuda.CUDAGraph()
+                    s = torch.cuda.Stream(dev)
+                    s.wait_stream(torch.cuda.current_stream(dev))
+                    with torch.cuda.stream(s), torch.cuda.graph(g, stream=s, capture_error_mode="thread_local"):
+                        for m in group:
+                            m._run(x, y, plan)
+                    torch.cuda.current_stream(dev).wait_stream(s)
+                    torch.cuda.synchronize(dev)
+                except RuntimeError as e:
+                    if verbose or not _CAPTURE_WARNED:
+                        _CAPTURE_WARNED.append(1)
+                        print("statetree tune: CUDA-graph capture failed, timing eagerly:", plan, str(e)[:120])
+                    del g
+                    torch.cuda.synchronize(dev)
+                    return res, True
+            evs = []
+            for i in range(iters + 2):
+                st.flush()
+                a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                a.record()
+                if g is not None:
+                    g.replay()
+                else:
+                    for m in group:
+                        m._run(x, y, plan)
+                b.record()
+                if i >= 2:
+                    evs.append((a, b))
+            torch.cuda.synchronize(dev)
+            del g
+            ts = sorted(a.elapsed_time(b) for a, b in evs)
+            res.append((ts[len(ts) // 2] / len(group), plan))
+        return res, False
 
     def prepare(self, batch_sizes=(1,)):
         """Build the side tables and resolve the plans for these batch sizes (do it before CUDA-graph capture)."""

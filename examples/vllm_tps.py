@@ -92,7 +92,8 @@ def worker(spec):
               gpu_memory_utilization=spec["gpu_mem"], max_model_len=spec["max_len"], enforce_eager=spec["eager"],
               enable_prefix_caching=False,                                  # time real prefills, not cache hits
               tensor_parallel_size=spec.get("tp", 1), pipeline_parallel_size=spec.get("pp", 1),
-              distributed_executor_backend="mp" if spec.get("tp", 1) * spec.get("pp", 1) > 1 else None)
+              distributed_executor_backend="mp" if spec.get("tp", 1) * spec.get("pp", 1) > 1 else None,
+              **({"max_num_seqs": spec["max_num_seqs"]} if spec.get("max_num_seqs") else {}))
     out = dict(load_s=round(time.perf_counter() - t0, 1))
     try:
         ranks = llm.collective_rpc(_inspect)
@@ -177,6 +178,8 @@ def main():
     ap.add_argument("--pp", type=int, default=1, help="pipeline-parallel stages")
     ap.add_argument("--layer-bench", action="store_true", help="also time every tree-layer shape vs BF16 F.linear "
                                                                    "inside the statetree engine (needs a BF16 copy)")
+    ap.add_argument("--max-num-seqs", type=int, default=None, help="vLLM max_num_seqs (hybrid models: at most the "
+                    "Mamba cache blocks the KV budget leaves)")
     ap.add_argument("--out", default="results/vllm_tps.json")
     ap.add_argument("--worker", default=None, help=argparse.SUPPRESS)
     args = ap.parse_args()
@@ -186,7 +189,7 @@ def main():
     base = dict(model=args.model, batches=[int(b) for b in args.batches.split(",")], new=args.new,
                 prompt_len=args.prompt_len, prefill=[int(t) for t in args.prefill.split(",") if t],
                 gpu_mem=args.gpu_mem, max_len=args.max_len, eager=args.eager, layer_bench=args.layer_bench,
-                tp=args.tp, pp=args.pp)
+                tp=args.tp, pp=args.pp, max_num_seqs=args.max_num_seqs)
     res = dict(model=args.model)
     for tag in args.reps.split(","):
         res[tag] = run_engine(dict(base, representation=tag), log=os.path.splitext(args.out)[0] + f"_{tag}.log")
