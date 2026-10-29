@@ -253,6 +253,560 @@ void mv7(torch::Tensor T, torch::Tensor EO, torch::Tensor EL, torch::Tensor X, t
   else { if (PF == 4) launch_mv7<4, 4>(a, G, st); else launch_mv7<4, 2>(a, G, st); }
 }
 
+// ---------------------------------------------------------------------------------------------- mvs (Hopper)
+// mv7 with the activations staged in shared memory. mv7 loads each record's activation fragments with 4-byte loads at
+// the record's prefetch: at batch > 1 a warp's 8 loads per record touch 8 rows each (64 L1 wavefronts per 1552-byte
+// record) and hold 8 registers per prefetched record. On the H100, whose HBM feeds each SM ~1.5x more bytes per cycle
+// than the A100's, that costs 13-20% at batch 8 and more at 16-32 (Qwen3-8B layers). Here the block copies its slice
+// of X (rows < B, the columns of its split-K range; padded rows: conflict-free) to shared memory once with cp.async,
+// issued after the first records' loads so it overlaps them, and every k-step pair reads its B fragments with one
+// ldmatrix.x4 per 8 batch rows. Rows >= B are not copied: they only feed output columns that are never stored.
+// Records, decode, escapes (EO / EL lists, per-warp image) and mma order are mv7's: outputs are bit-identical to mv7 on
+// the same (WM, WK, GY). Ranked by the tuner only on sm_90+ (statetree.linear.candidates); the A100 keeps mv7.
+__device__ __forceinline__ void ldsm_x4s(uint32_t addr, uint32_t* r) { ldsm_x4(addr, r[0], r[1], r[2], r[3]); }
+
+template <int NT>
+struct FS { uint4 c0, c1, c2; uint32_t e; int lo, hi; };
+
+__device__ __forceinline__ void load_fs(FS<1>& f, const A7& a, const uint8_t* rec, const int* eo, int lane) {
+  f.c0 = ldw(rec + lane * 16);
+  f.c1 = ldw(rec + 512 + lane * 16);
+  f.c2 = ldw(rec + 1024 + lane * 16);
+  f.e = __ldg((const uint16_t*)(rec + 1536) + (lane >> 2));
+  f.lo = __ldg(eo);
+  f.hi = __ldg(eo + 1);
+}
+
+static inline int mvs_xrow(int N, int GY) { return (N / 64 + GY - 1) / GY * 64 + 8; }   // bf16 per staged row
+
+template <int NT, int PF>
+__global__ void __launch_bounds__(256) mvs_kernel(A7 a) {
+  extern __shared__ __align__(16) float smem[];
+  const int NG = a.N / 64;
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int g = lane >> 2, t = lane & 3;
+  const int wm = warp % a.WM, wk = warp / a.WM;
+  const int tile = blockIdx.x * a.WM + wm;
+  const int GY = gridDim.y;
+  const int cg0 = NG * blockIdx.y / GY, cg1 = NG * (blockIdx.y + 1) / GY;
+  const int G0 = cg0 + (cg1 - cg0) * wk / a.WK, G1 = cg0 + (cg1 - cg0) * (wk + 1) / a.WK;
+  const int R = a.WM * 16, ELN = R * NT * 8;
+  uint32_t (*s_em)[32] = (uint32_t (*)[32])(smem + (a.WK + 1) * ELN);   // per-warp escape images, as mv7
+  uint16_t (*s_ev)[1024] = (uint16_t (*)[1024])(s_em + a.WM * a.WK);
+  uint16_t* xs = (uint16_t*)(s_ev + a.WM * a.WK);                        // [8 NT rows][XROW]: rows < B staged
+  const int XROW = (NG + GY - 1) / GY * 64 + 8;
+  const uint8_t* rec0 = a.T + ((size_t)tile * NG + G0) * 1552;
+  const int* eo0 = a.EO + (size_t)tile * NG + G0;
+  float c[NT][4];
+#pragma unroll
+  for (int nt = 0; nt < NT; ++nt) c[nt][0] = c[nt][1] = c[nt][2] = c[nt][3] = 0.f;
+  FS<1> f[PF];
+#pragma unroll
+  for (int i = 0; i < PF; ++i)
+    if (G0 + i < G1) load_fs(f[i], a, rec0 + (size_t)i * 1552, eo0 + i, lane);
+  {                                                                      // stage X's slice (overlaps the loads above)
+    const int ch = (cg1 - cg0) * 8;                                      // 16-byte chunks per row
+    for (int i = threadIdx.x; i < a.B * ch; i += blockDim.x) {
+      const int n = i / ch, q = i - n * ch;
+      cp_async16(smem_u32(xs + n * XROW + q * 8), a.X + (size_t)n * a.N + cg0 * 64 + q * 8, 16);
+    }
+    cp_commit();
+    cp_wait<0>();
+    __syncthreads();
+  }
+  // ldmatrix.x4 row addresses: lane l feeds matrix j = l / 8 (k-step s + j / 2, half j % 2), batch row nt * 8 + l % 8
+  const uint32_t xbase = smem_u32(xs) + (uint32_t)(((lane & 7) * XROW + ((lane >> 4) & 1) * 16 + ((lane >> 3) & 1) * 8) * 2);
+  for (int G = G0; G < G1; G += PF) {
+#pragma unroll
+    for (int i = 0; i < PF; ++i) {
+      if (G + i < G1) {
+        const uint32_t E0 = (f[i].e & 0xFFu) * 0x01010101u, E1 = ((f[i].e >> 8) & 0xFFu) * 0x01010101u;
+        const uint32_t pm = (f[i].lo < f[i].hi) ? esc_scatter(a.EL, f[i].lo, f[i].hi, lane, s_em[warp], s_ev[warp]) : 0u;
+        const uint32_t xg = xbase + (uint32_t)((G + i - cg0) * 64 * 2);
+#pragma unroll
+        for (int sp = 0; sp < 2; ++sp) {                                 // k-steps 2 sp, 2 sp + 1
+          uint32_t xb[NT][4];
+#pragma unroll
+          for (int nt = 0; nt < NT; ++nt) ldsm_x4s(xg + (uint32_t)((nt * 8 * XROW + 32 * sp) * 2), xb[nt]);
+#pragma unroll
+          for (int h = 0; h < 2; ++h) {
+            const int s = 2 * sp + h;
+            uint32_t A[4];
+            dec_step5(f[i].c0, f[i].c1, f[i].c2, E0, E1, s, A);
+            if (pm) esc_apply(pm, s_ev[warp] + lane * 32, s, A);
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt) mma16816(c[nt], A, xb[nt][2 * h], xb[nt][2 * h + 1]);
+          }
+        }
+        if (G + i + PF < G1) load_fs(f[i], a, rec0 + (size_t)(G + i + PF - G0) * 1552, eo0 + G + i + PF - G0, lane);
+      }
+    }
+  }
+  float* red = smem;
+  float* out = smem + a.WK * ELN;
+#pragma unroll
+  for (int nt = 0; nt < NT; ++nt) {
+    const int rr = wm * 16 + g, n = nt * 8 + 2 * t;
+    red[wk * ELN + n * R + rr] = c[nt][0];
+    red[wk * ELN + (n + 1) * R + rr] = c[nt][1];
+    red[wk * ELN + n * R + rr + 8] = c[nt][2];
+    red[wk * ELN + (n + 1) * R + rr + 8] = c[nt][3];
+  }
+  __syncthreads();
+  for (int idx = threadIdx.x; idx < ELN; idx += blockDim.x) {
+    float s = 0.f;
+    for (int k = 0; k < a.WK; ++k) s += red[k * ELN + idx];
+    out[idx] = s;
+  }
+  __syncthreads();
+  if (GY > 1 && !merge7(a, out, ELN, blockIdx.x, blockIdx.y, GY)) return;
+  for (int idx = threadIdx.x; idx < ELN; idx += blockDim.x) {
+    const int n = idx / R, r = idx % R;
+    if (n < a.B) a.Y[(size_t)n * a.M + (size_t)blockIdx.x * R + r] = __float2bfloat16_rn(out[idx]);
+  }
+}
+
+static size_t mvs_smem(int NT, int WM, int WK, int GY, int N) {     // ldmatrix reads 8 NT rows (rows >= B: unused)
+  return (size_t)(WK + 1) * WM * 16 * NT * 8 * sizeof(float) + (size_t)WM * WK * ESC_IMG_BYTES +
+         (size_t)NT * 8 * mvs_xrow(N, GY) * 2;
+}
+
+template <int NT, int PF>
+void launch_mvs(const A7& a, int GY, cudaStream_t st) {
+  dim3 grid(a.M / (16 * a.WM), GY);
+  const size_t sm = mvs_smem(NT, a.WM, a.WK, GY, a.N);
+  if (sm > 48 * 1024)
+    C10_CUDA_CHECK(cudaFuncSetAttribute(mvs_kernel<NT, PF>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm));
+  mvs_kernel<NT, PF><<<grid, 32 * a.WM * a.WK, sm, st>>>(a);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void mvs(torch::Tensor T, torch::Tensor EO, torch::Tensor EL, torch::Tensor X, torch::Tensor Y, torch::Tensor WS,
+         torch::Tensor CNT, int64_t WM, int64_t WK, int64_t GY, int64_t PF) {
+  const c10::cuda::OptionalCUDAGuard guard(T.device());
+  A7 a = make_a7(T, EO, EL, X, Y, WS, CNT);
+  a.WM = WM; a.WK = WK;
+  TORCH_CHECK(a.B >= 1 && a.B <= 32 && a.M % (16 * a.WM) == 0 && a.N % 64 == 0 && a.WM * a.WK <= 8 && GY >= 1 &&
+              GY <= a.N / 64 && X.data_ptr() != nullptr && ((uintptr_t)X.data_ptr() & 15) == 0, "mvs config");
+  cudaStream_t st = at::cuda::getCurrentCUDAStream();
+  const int G = (int)GY;
+  if (a.B <= 8) { if (PF == 4) launch_mvs<1, 4>(a, G, st); else launch_mvs<1, 2>(a, G, st); }
+  else if (a.B <= 16) { if (PF == 4) launch_mvs<2, 4>(a, G, st); else launch_mvs<2, 2>(a, G, st); }
+  else { if (PF == 4) launch_mvs<4, 4>(a, G, st); else launch_mvs<4, 2>(a, G, st); }
+}
+
+int64_t mvs_smem_bytes(int64_t B, int64_t N, int64_t WM, int64_t WK, int64_t GY) {
+  return (int64_t)mvs_smem(B <= 8 ? 1 : (B <= 16 ? 2 : 4), (int)WM, (int)WK, (int)GY, (int)N);
+}
+
+// ---------------------------------------------------------------------------------------------- mvh (Hopper, B <= 8)
+// mv7 with a lean inner loop, for GPUs whose SMs rather than HBM limit the matrix-vector product. On the H100, above all
+// under a power cap (the SM clock falls to 345-1100 MHz while HBM keeps streaming), mv7's ~175 instructions per
+// 1552-byte record (8 activation loads, 2 escape-offset loads, divergence handling) bound it, not the bytes. Here, per
+// record: 3 + 1 loads, the 4-k-step decode into 16 A registers, 2 ldmatrix.x4 of the staged activations (rows < B
+// staged, row addresses clamped to B - 1), 4 mma. Escapes: one escape-offset load per lane per 32 records; a ballot
+// marks the records that have entries (warp-uniform test), and only those patch (entries fetched 32 at a time, shuffled
+// to their lane, register selects). mma order as mv7: outputs are bit-identical to mv7 for the same split.
+__device__ __forceinline__ void patch16(uint32_t (&A)[4][4], const uint32_t* EL, int lo, int hi, int lane) {
+#pragma unroll 1
+  for (int base = lo; base < hi; base += 32) {
+    const int e = base + lane;
+    const uint32_t v = (e < hi) ? __ldg(EL + e) : 0u;
+    uint32_t mask = __ballot_sync(0xFFFFFFFFu, e < hi);
+#pragma unroll 1
+    while (mask) {
+      const int b = __ffs(mask) - 1;
+      mask &= mask - 1;
+      const uint32_t vv = __shfl_sync(0xFFFFFFFFu, v, b);
+      const int f = ((int)((vv >> 5) & 31u) == lane) ? (int)((vv >> 1) & 15u) : -1;      // k-step * 4 + register
+      const uint32_t sh = (vv & 1u) * 16u, keep = ~(0xFFFFu << sh), val = (vv >> 16) << sh;
+#pragma unroll
+      for (int k = 0; k < 4; ++k)
+#pragma unroll
+        for (int q = 0; q < 4; ++q) A[k][q] = (f == k * 4 + q) ? ((A[k][q] & keep) | val) : A[k][q];
+    }
+  }
+}
+
+template <int PF>
+__global__ void __launch_bounds__(256) mvh_kernel(A7 a) {
+  extern __shared__ __align__(16) float smem[];
+  const int NG = a.N / 64;
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int g = lane >> 2, t = lane & 3;
+  const int wm = warp % a.WM, wk = warp / a.WM;
+  const int tile = blockIdx.x * a.WM + wm;
+  const int GY = gridDim.y;
+  const int cg0 = NG * blockIdx.y / GY, cg1 = NG * (blockIdx.y + 1) / GY;
+  const int G0 = cg0 + (cg1 - cg0) * wk / a.WK, G1 = cg0 + (cg1 - cg0) * (wk + 1) / a.WK;
+  const int n = G1 - G0;                                                 // this warp's records
+  const int R = a.WM * 16, ELN = R * 8;
+  uint16_t* xs = (uint16_t*)(smem + (a.WK + 1) * ELN);                   // [B rows][XROW]
+  const int XROW = (NG + GY - 1) / GY * 64 + 8;
+  const size_t r0 = (size_t)tile * NG + G0;
+  const uint8_t* rp = a.T + r0 * 1552 + lane * 16;
+  const uint16_t* ep = (const uint16_t*)(a.T + r0 * 1552 + 1536) + g;
+  const int* eo = a.EO + r0;
+  uint4 c0[PF], c1[PF], c2[PF];
+  uint32_t ee[PF];
+  auto reload = [&](int i, int j) {
+    const uint8_t* p = rp + (size_t)j * 1552;
+    c0[i] = ldw(p);
+    c1[i] = ldw(p + 512);
+    c2[i] = ldw(p + 1024);
+    ee[i] = __ldg(ep + (size_t)j * 776);
+  };
+#pragma unroll
+  for (int i = 0; i < PF; ++i)
+    if (i < n) reload(i, i);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  // launched as a programmatic dependent (sm_90+): the first records are in flight while the previous kernel drains;
+  // X, Y, WS and CNT are touched only after its completion (no-op when there is no programmatic dependency)
+  asm volatile("griddepcontrol.wait;\n" ::: "memory");
+#endif
+  {                                                                      // stage X's rows < B (overlaps the loads)
+    const int ch = (cg1 - cg0) * 8;
+    for (int i = threadIdx.x; i < a.B * ch; i += blockDim.x) {
+      const int r = i / ch, q = i - r * ch;
+      cp_async16(smem_u32(xs + r * XROW + q * 8), a.X + (size_t)r * a.N + cg0 * 64 + q * 8, 16);
+    }
+    cp_commit();
+    cp_wait<0>();
+    __syncthreads();
+  }
+  // ldmatrix.x4 row addresses as mvs (matrix j = lane / 8: k-step 2 sp + j / 2, half j % 2), batch row min(lane % 8, B - 1)
+  const int xrow = min(lane & 7, a.B - 1);
+  const uint32_t xa = smem_u32(xs) + (uint32_t)((xrow * XROW + ((lane >> 4) & 1) * 16 + ((lane >> 3) & 1) * 8 +
+                                                 (G0 - cg0) * 64) * 2);
+  float c[4] = {0.f, 0.f, 0.f, 0.f};
+  int eol = 0, eoh = 0;
+  uint32_t em = 0u;
+  auto window = [&](int j) {                                             // escape lists of records j .. j + 31
+    const int jj = j + lane;
+    eol = (jj < n) ? __ldg(eo + jj) : 0;
+    eoh = (jj < n) ? __ldg(eo + jj + 1) : 0;
+    em = __ballot_sync(0xFFFFFFFFu, eoh > eol);
+  };
+  auto step = [&](int i, int j) {                                        // record j, held in slot i
+    const uint32_t E0 = (ee[i] & 0xFFu) * 0x01010101u, E1 = (ee[i] >> 8) * 0x01010101u;
+    uint32_t A[4][4];
+#pragma unroll
+    for (int s = 0; s < 4; ++s) dec_step5(c0[i], c1[i], c2[i], E0, E1, s, A[s]);
+    if ((em >> (j & 31)) & 1u)
+      patch16(A, a.EL, __shfl_sync(0xFFFFFFFFu, eol, j & 31), __shfl_sync(0xFFFFFFFFu, eoh, j & 31), lane);
+    uint32_t xb[2][4];
+    ldsm_x4s(xa + (uint32_t)(j * 128), xb[0]);
+    ldsm_x4s(xa + (uint32_t)(j * 128 + 64), xb[1]);
+#pragma unroll
+    for (int s = 0; s < 4; ++s) mma16816(c, A[s], xb[s >> 1][2 * (s & 1)], xb[s >> 1][2 * (s & 1) + 1]);
+  };
+  int j0 = 0;
+  for (; j0 + 2 * PF <= n; j0 += PF) {                                   // steady state: no bounds tests
+    if ((j0 & 31) == 0) window(j0);
+#pragma unroll
+    for (int i = 0; i < PF; ++i) {
+      step(i, j0 + i);
+      reload(i, j0 + i + PF);
+    }
+  }
+  for (; j0 < n; j0 += PF) {                                             // the last 1 .. 2 PF - 1 records
+    if ((j0 & 31) == 0) window(j0);
+#pragma unroll
+    for (int i = 0; i < PF; ++i)
+      if (j0 + i < n) {
+        step(i, j0 + i);
+        if (j0 + i + PF < n) reload(i, j0 + i + PF);
+      }
+  }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");   // the next kernel may start its prologue
+#endif
+  float* red = smem;
+  float* out = smem + a.WK * ELN;
+  {
+    const int rr = wm * 16 + g, nn = 2 * t;
+    red[wk * ELN + nn * R + rr] = c[0];
+    red[wk * ELN + (nn + 1) * R + rr] = c[1];
+    red[wk * ELN + nn * R + rr + 8] = c[2];
+    red[wk * ELN + (nn + 1) * R + rr + 8] = c[3];
+  }
+  __syncthreads();
+  for (int idx = threadIdx.x; idx < ELN; idx += blockDim.x) {
+    float s = 0.f;
+    for (int k = 0; k < a.WK; ++k) s += red[k * ELN + idx];
+    out[idx] = s;
+  }
+  __syncthreads();
+  if (GY > 1 && !merge7(a, out, ELN, blockIdx.x, blockIdx.y, GY)) return;
+  for (int idx = threadIdx.x; idx < ELN; idx += blockDim.x) {
+    const int nn = idx / R, r = idx % R;
+    if (nn < a.B) a.Y[(size_t)nn * a.M + (size_t)blockIdx.x * R + r] = __float2bfloat16_rn(out[idx]);
+  }
+}
+
+static size_t mvh_smem(int B, int WM, int WK, int GY, int N) {          // reduction buffers + rows < B of X
+  return (size_t)(WK + 1) * WM * 16 * 8 * sizeof(float) + (size_t)B * mvs_xrow(N, GY) * 2;
+}
+
+// programmatic dependent launch (sm_90+; STATETREE_PDL=0 disables): the kernel may start while the previous kernel in
+// the stream drains, and griddepcontrol.wait orders its reads of X after that kernel's writes
+static bool pdl_on() {
+  static int dev_pdl[64] = {0};                                          // 0 unknown, 1 off, 2 on
+  int dev = 0;
+  cudaGetDevice(&dev);
+  int& v = dev_pdl[dev & 63];
+  if (v == 0) {
+    int major = 0;
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+    const char* e = getenv("STATETREE_PDL");
+    v = (major >= 9 && !(e && e[0] == '0')) ? 2 : 1;
+  }
+  return v == 2;
+}
+
+template <int PF>
+void launch_mvh(const A7& a, int GY, cudaStream_t st) {
+  const size_t sm = mvh_smem(a.B, a.WM, a.WK, GY, a.N);
+  if (sm > 48 * 1024)
+    C10_CUDA_CHECK(cudaFuncSetAttribute(mvh_kernel<PF>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm));
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = dim3(a.M / (16 * a.WM), GY);
+  cfg.blockDim = dim3(32 * a.WM * a.WK);
+  cfg.dynamicSmemBytes = sm;
+  cfg.stream = st;
+  cudaLaunchAttribute attr[1];
+  attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr[0].val.programmaticStreamSerializationAllowed = 1;
+  cfg.attrs = attr;
+  cfg.numAttrs = pdl_on() ? 1 : 0;
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, mvh_kernel<PF>, a));
+}
+
+void mvh(torch::Tensor T, torch::Tensor EO, torch::Tensor EL, torch::Tensor X, torch::Tensor Y, torch::Tensor WS,
+         torch::Tensor CNT, int64_t WM, int64_t WK, int64_t GY, int64_t PF) {
+  const c10::cuda::OptionalCUDAGuard guard(T.device());
+  A7 a = make_a7(T, EO, EL, X, Y, WS, CNT);
+  a.WM = WM; a.WK = WK;
+  TORCH_CHECK(a.B >= 1 && a.B <= 8 && a.M % (16 * a.WM) == 0 && a.N % 64 == 0 && a.WM * a.WK <= 8 && GY >= 1 &&
+              GY <= a.N / 64 && X.is_contiguous() && ((uintptr_t)X.data_ptr() & 15) == 0, "mvh config");
+  cudaStream_t st = at::cuda::getCurrentCUDAStream();
+  if (PF == 4) launch_mvh<4>(a, (int)GY, st);
+  else launch_mvh<2>(a, (int)GY, st);
+}
+
+int64_t mvh_smem_bytes(int64_t B, int64_t N, int64_t WM, int64_t WK, int64_t GY) {
+  return (int64_t)mvh_smem((int)B, (int)WM, (int)WK, (int)GY, (int)N);
+}
+
+// ---------------------------------------------------------------------------------------------- mvc (Hopper, B <= 8)
+// The matrix-vector product as a sweep over the records in memory order. In mv7 / mvh every warp streams its own run of
+// one tile's records, so ~2000 concurrent streams sit 25-100 KB apart: on the H100 that read pattern alone costs ~15%
+// against a linear read in short bursts and ~35% under a power cap (more DRAM energy per byte: the GPU then lowers the
+// SM clock further). Here a CTA owns TC consecutive tiles (or 1 / GY of one tile's columns) and its WK warps take the
+// records round-robin: at every step the CTA reads WK consecutive records, and all CTAs are resident at once. A warp
+// keeps one accumulator per tile (parked in shared memory when its tile ends); the CTA sums the warps' partials in a fixed
+// order (and merges GY column splits as mv7): deterministic, a different summation order than mv7.
+// Escapes: a warp reads the escape offsets of its next 32 records one window ahead; when a record is loaded, its first
+// 32 entries are fetched with it (one per lane), so patching never waits on a dependent load.
+__device__ __forceinline__ void patch_pre(uint32_t (&A)[4][4], uint32_t ev, int cnt, int lo, const uint32_t* EL,
+                                          int lane) {
+  uint32_t mask = cnt >= 32 ? 0xFFFFFFFFu : ((1u << cnt) - 1u);
+#pragma unroll 1
+  for (int base = 0;;) {
+#pragma unroll 1
+    while (mask) {
+      const int b = __ffs(mask) - 1;
+      mask &= mask - 1;
+      const uint32_t vv = __shfl_sync(0xFFFFFFFFu, ev, b);
+      const int f = ((int)((vv >> 5) & 31u) == lane) ? (int)((vv >> 1) & 15u) : -1;      // k-step * 4 + register
+      const uint32_t sh = (vv & 1u) * 16u, keep = ~(0xFFFFu << sh), val = (vv >> 16) << sh;
+#pragma unroll
+      for (int k = 0; k < 4; ++k)
+#pragma unroll
+        for (int q = 0; q < 4; ++q) A[k][q] = (f == k * 4 + q) ? ((A[k][q] & keep) | val) : A[k][q];
+    }
+    base += 32;
+    if (base >= cnt) break;
+    ev = (base + lane < cnt) ? __ldg(EL + lo + base + lane) : 0u;     // more than 32 entries: the next 32
+    mask = (cnt - base >= 32) ? 0xFFFFFFFFu : ((1u << (cnt - base)) - 1u);
+  }
+}
+
+template <int PF>
+__global__ void __launch_bounds__(256, PF == 2 ? 3 : 2) mvc_kernel(A7 a, int TC) {   // 3 resident CTAs at PF = 2
+  extern __shared__ __align__(16) float smem[];
+  const int NG = a.N / 64;
+  const int lane = threadIdx.x & 31, wk = threadIdx.x >> 5;
+  const int g = lane >> 2, t = lane & 3;
+  const int WK = a.WK;
+  const int GY = gridDim.y;
+  const int cg0 = NG * blockIdx.y / GY, cg1 = NG * (blockIdx.y + 1) / GY;
+  const int per = (cg1 - cg0) / WK;                                      // records per warp and tile
+  const int n = TC * per;                                                // records of this warp
+  const int tile0 = blockIdx.x * TC;
+  float* red = smem;                                                     // [TC][WK][128]: per-warp partial tiles
+  float* outb = red + TC * WK * 128;                                     // [TC][128]
+  uint16_t* xs = (uint16_t*)(outb + TC * 128);                           // [B][XROW]
+  const int XROW = (cg1 - cg0) * 64 + 8;
+  const size_t r0 = (size_t)tile0 * NG + cg0 + wk;                       // record q of this warp: r0 + q WK
+  const size_t RS = (size_t)WK * 1552;
+  const uint8_t* rp = a.T + r0 * 1552 + lane * 16;
+  const uint16_t* ep = (const uint16_t*)(a.T + r0 * 1552 + 1536) + g;
+  const int* eo = a.EO + r0;
+  uint4 c0[PF], c1[PF], c2[PF];
+  uint32_t ee[PF], ev[PF];
+  int ecnt[PF], elo[PF];
+  int wl = 0, wh = 0, nl = 0, nh = 0;
+  uint32_t wmask = 0u;
+  auto wload = [&](int w, int& lo, int& hi) {                            // escape offsets of window w (records 32 w ..)
+    const int q = w * 32 + lane;
+    lo = (q < n) ? __ldg(eo + (size_t)q * WK) : 0;
+    hi = (q < n) ? __ldg(eo + (size_t)q * WK + 1) : 0;
+  };
+  const uint8_t* np = rp;                                                // the next record to load (record q)
+  const uint16_t* nep = ep;
+  auto reload = [&](int i, int q) {                                      // record q into slot i (q = 0, 1, 2, ..)
+    if ((q & 31) == 0) {                                                 // window q / 32 (fetched a window ago)
+      wl = nl;
+      wh = nh;
+      wmask = __ballot_sync(0xFFFFFFFFu, wh > wl);
+      wload((q >> 5) + 1, nl, nh);
+    }
+    c0[i] = ldw(np);
+    c1[i] = ldw(np + 512);
+    c2[i] = ldw(np + 1024);
+    ee[i] = __ldg(nep);
+    np += RS;
+    nep += RS / 2;
+    ecnt[i] = 0;
+    if ((wmask >> (q & 31)) & 1u) {
+      const int lo = __shfl_sync(0xFFFFFFFFu, wl, q & 31), hi = __shfl_sync(0xFFFFFFFFu, wh, q & 31);
+      ecnt[i] = hi - lo;
+      elo[i] = lo;
+      ev[i] = (lane < hi - lo) ? __ldg(a.EL + lo + lane) : 0u;
+    }
+  };
+  wload(0, nl, nh);
+#pragma unroll
+  for (int i = 0; i < PF; ++i)
+    if (i < n) reload(i, i);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile("griddepcontrol.wait;\n" ::: "memory");                  // X / WS / CNT after the previous kernel
+#endif
+  {
+    const int ch = (cg1 - cg0) * 8;
+    for (int i = threadIdx.x; i < a.B * ch; i += blockDim.x) {
+      const int r = i / ch, q = i - r * ch;
+      cp_async16(smem_u32(xs + r * XROW + q * 8), a.X + (size_t)r * a.N + cg0 * 64 + q * 8, 16);
+    }
+    cp_commit();
+    cp_wait<0>();
+    __syncthreads();
+  }
+  const int xrow = min(lane & 7, a.B - 1);
+  const uint32_t xa0 = smem_u32(xs) + (uint32_t)((xrow * XROW + ((lane >> 4) & 1) * 16 + ((lane >> 3) & 1) * 8 +
+                                                  wk * 64) * 2);
+  float c[4] = {0.f, 0.f, 0.f, 0.f};
+  int qq = 0, tc = 0;
+  uint32_t xq = xa0;
+  auto step = [&](int i) {
+    const uint32_t E0 = (ee[i] & 0xFFu) * 0x01010101u, E1 = (ee[i] >> 8) * 0x01010101u;
+    uint32_t A[4][4];
+#pragma unroll
+    for (int s = 0; s < 4; ++s) dec_step5(c0[i], c1[i], c2[i], E0, E1, s, A[s]);
+    if (ecnt[i]) patch_pre(A, ev[i], ecnt[i], elo[i], a.EL, lane);
+    uint32_t xb[2][4];
+    ldsm_x4s(xq, xb[0]);
+    ldsm_x4s(xq + 64, xb[1]);
+#pragma unroll
+    for (int s = 0; s < 4; ++s) mma16816(c, A[s], xb[s >> 1][2 * (s & 1)], xb[s >> 1][2 * (s & 1) + 1]);
+    xq += (uint32_t)(WK * 128);
+    if (++qq == per) {                                                   // this warp's share of the tile is done
+      float* rw = red + (tc * WK + wk) * 128;
+      rw[(2 * t) * 16 + g] = c[0];
+      rw[(2 * t + 1) * 16 + g] = c[1];
+      rw[(2 * t) * 16 + g + 8] = c[2];
+      rw[(2 * t + 1) * 16 + g + 8] = c[3];
+      c[0] = c[1] = c[2] = c[3] = 0.f;
+      qq = 0;
+      ++tc;
+      xq = xa0;
+    }
+  };
+  int j0 = 0;
+  for (; j0 + 2 * PF <= n; j0 += PF) {
+#pragma unroll
+    for (int i = 0; i < PF; ++i) {
+      step(i);
+      reload(i, j0 + i + PF);
+    }
+  }
+  for (; j0 < n; j0 += PF) {
+#pragma unroll
+    for (int i = 0; i < PF; ++i)
+      if (j0 + i < n) {
+        step(i);
+        if (j0 + i + PF < n) reload(i, j0 + i + PF);
+      }
+  }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+#endif
+  __syncthreads();
+  for (int idx = threadIdx.x; idx < TC * 128; idx += blockDim.x) {
+    const int tt = idx >> 7, e = idx & 127;
+    float s = 0.f;
+    for (int k = 0; k < WK; ++k) s += red[(tt * WK + k) * 128 + e];
+    outb[idx] = s;
+  }
+  __syncthreads();
+  if (GY > 1 && !merge7(a, outb, 128, blockIdx.x, blockIdx.y, GY)) return;   // GY > 1: TC = 1, tile = blockIdx.x
+  for (int idx = threadIdx.x; idx < TC * 128; idx += blockDim.x) {
+    const int tt = idx >> 7, e = idx & 127, nn = e >> 4, r = e & 15;
+    if (nn < a.B) a.Y[(size_t)nn * a.M + (size_t)(tile0 + tt) * 16 + r] = __float2bfloat16_rn(outb[idx]);
+  }
+}
+
+static size_t mvc_smem(int B, int WK, int GY, int TC, int N) {
+  return (size_t)TC * (WK + 1) * 128 * sizeof(float) + (size_t)B * ((N / 64) / GY * 64 + 8) * 2;
+}
+
+template <int PF>
+void launch_mvc(const A7& a, int GY, int TC, cudaStream_t st) {
+  const size_t sm = mvc_smem(a.B, a.WK, GY, TC, a.N);
+  if (sm > 48 * 1024)
+    C10_CUDA_CHECK(cudaFuncSetAttribute(mvc_kernel<PF>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm));
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = dim3(a.M / 16 / TC, GY);
+  cfg.blockDim = dim3(32 * a.WK);
+  cfg.dynamicSmemBytes = sm;
+  cfg.stream = st;
+  cudaLaunchAttribute attr[1];
+  attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr[0].val.programmaticStreamSerializationAllowed = 1;
+  cfg.attrs = attr;
+  cfg.numAttrs = pdl_on() ? 1 : 0;
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, mvc_kernel<PF>, a, TC));
+}
+
+void mvc(torch::Tensor T, torch::Tensor EO, torch::Tensor EL, torch::Tensor X, torch::Tensor Y, torch::Tensor WS,
+         torch::Tensor CNT, int64_t WK, int64_t GY, int64_t TC, int64_t PF) {
+  const c10::cuda::OptionalCUDAGuard guard(T.device());
+  A7 a = make_a7(T, EO, EL, X, Y, WS, CNT);
+  a.WM = 1; a.WK = WK;
+  const int NG = a.N / 64, tiles = a.M / 16;
+  TORCH_CHECK(a.B >= 1 && a.B <= 8 && a.M % 16 == 0 && a.N % 64 == 0 && WK >= 1 && WK <= 8 && GY >= 1 && TC >= 1 &&
+              NG % (GY * WK) == 0 && tiles % TC == 0 && (TC == 1 || GY == 1) && X.is_contiguous() &&
+              ((uintptr_t)X.data_ptr() & 15) == 0, "mvc config");
+  cudaStream_t st = at::cuda::getCurrentCUDAStream();
+  if (PF == 4) launch_mvc<4>(a, (int)GY, (int)TC, st);
+  else launch_mvc<2>(a, (int)GY, (int)TC, st);
+}
+
+int64_t mvc_smem_bytes(int64_t B, int64_t N, int64_t WK, int64_t GY, int64_t TC) {
+  return (int64_t)mvc_smem((int)B, (int)WK, (int)GY, (int)TC, (int)N);
+}
+
 // ---------------------------------------------------------------------------------------------- mvx (MoE)
 // Mixture-of-experts matrix-vector products without a BF16 copy of the experts: slot s multiplies row s / xdiv of X by
 // the M x N matrix of expert ids[s] (its tree, escape offsets and escape list at TP / EOP / ELP[ids[s]]: separate

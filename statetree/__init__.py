@@ -12,7 +12,7 @@ from .experts import TreeExperts
 from .linear import TreeEmbedding, TreeLinear, TreeSlice
 from .model import DEFAULT_FUSE, convert, load_pretrained, prepare, save_pretrained, size_report, tree_modules
 
-__version__ = "0.5.2"
+__version__ = "0.5.3"
 __all__ = ["TreeLinear", "TreeSlice", "TreeEmbedding", "TreeExperts", "DEFAULT_FUSE", "convert", "prepare", "save_pretrained",
            "load_pretrained", "size_report", "tree_modules", "encode", "decode_reference"]
 from .dense16 import Dense16Linear  # noqa: E402,F401  (ablation control)

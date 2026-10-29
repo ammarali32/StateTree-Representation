@@ -78,7 +78,7 @@ class Dense16Linear(TreeLinear):
         return None, None
 
     def _valid(self, path, prm, B):
-        if path == "tm":
+        if path in ("tm", "mvs", "mvh", "mvc", "mvt", "th"):
             return False
         if path == "mv":
             return B <= 32 and self.out_features % (16 * prm[0]) == 0

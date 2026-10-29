@@ -9,16 +9,19 @@ def ext():
     if _EXT is None:
         try:
             from . import _C as mod
-            if getattr(mod, "ABI", 0) < 53:             # a prebuilt extension from before 0.5.2 (mvw)
+            if getattr(mod, "ABI", 0) < 58:             # a prebuilt extension from before 0.5.3 (mvs, th, mvh, mvc, mvt)
                 raise ImportError("stale statetree._C")
         except ImportError:
             from torch.utils.cpp_extension import load
             src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc")
             import torch
             tv = torch.__version__.split("+")[0].replace(".", "_")             # one build per torch version (venvs)
-            mod = load(name=f"statetree_C_0_5_2b_t{tv}",
-                       sources=[os.path.join(src, f) for f in ("kernels.cu", "tt.cu", "gtt.cu", "bindings.cpp")],
-                       extra_cflags=["-O3"], extra_cuda_cflags=["-O3", "-std=c++17"],
+            cuda_flags = ["-O3", "-std=c++17"]
+            if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9:
+                cuda_flags.append("-gencode=arch=compute_90a,code=sm_90a")         # the Hopper th kernel
+            mod = load(name=f"statetree_C_0_5_3_t{tv}",
+                       sources=[os.path.join(src, f) for f in ("kernels.cu", "tt.cu", "gtt.cu", "hop.cu", "bindings.cpp")],
+                       extra_cflags=["-O3"], extra_cuda_cflags=cuda_flags,
                        verbose=os.environ.get("STATETREE_VERBOSE", "0") == "1")
         _EXT = mod
     return _EXT

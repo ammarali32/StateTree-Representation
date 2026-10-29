@@ -6,7 +6,7 @@ import torch.nn as nn
 
 import statetree
 from statetree import format as F
-from statetree.linear import TreeEmbedding, TreeLinear, candidates, _state
+from statetree.linear import TreeEmbedding, TreeLinear, _mv_cfgs, candidates, _state
 
 DEV = "cuda"
 
@@ -106,13 +106,185 @@ def test_one_hot_exact_mv():
             x[torch.arange(B), cols] = 1
             want = W[:, cols].t().contiguous()
             n = 0
-            for path, prm in candidates(M, N, B, st):
-                if path == "mv" and tl._valid(path, prm, B):
+            for prm in _mv_cfgs(M, N // 64):            # every mv7 split, whatever the tuner ranks
+                if tl._valid("mv", prm, B):
                     y = torch.empty(B, M, device=DEV, dtype=torch.bfloat16)
-                    tl._run(x, y, (path, prm))
+                    tl._run(x, y, ("mv", prm))
                     assert torch.equal(y, want), (B, prm)
                     n += 1
             assert n > 0, B
+
+def test_one_hot_exact_mvs():
+    """mvs (the sm_90 matrix-vector kernel with staged activations; runs on any GPU) reproduces columns of W
+    bit-exactly with one-hot inputs, escapes included (none, one in every record, a fifth of all weights: the escape
+    image), and equals mv7 bit for bit on random inputs for the same split"""
+    M, N = 256, 1024
+    W1 = weights(M, N, 11)
+    W2 = weights(M, N, 12)
+    W2[torch.rand(M, N, device=DEV) < 0.2] *= 1e-6
+    W3 = weights(M, N, 13)
+    W3.view(M // 16, 16, N // 64, 64)[:, 3, :, 7] = 1e-30          # one escape in every record
+    for W in (W1, W2, W3):
+        tl = TreeLinear.from_linear(_lin(W))
+        for B in (1, 3, 8, 13, 16, 32):
+            x = torch.zeros(B, N, device=DEV, dtype=torch.bfloat16)
+            cols = (torch.arange(B, device=DEV) * 37 + 5) % N
+            x[torch.arange(B), cols] = 1
+            want = W[:, cols].t().contiguous()
+            xr = torch.randn(B, N, device=DEV, dtype=torch.bfloat16)
+            for WM, WK, GY in ((1, 1, 1), (1, 4, 1), (2, 2, 2), (1, 2, 4), (2, 4, 1)):
+                for PF in (2, 4):
+                    y = torch.empty(B, M, device=DEV, dtype=torch.bfloat16)
+                    tl._run(x, y, ("mvs", (WM, WK, GY, PF)))
+                    assert torch.equal(y, want), (B, WM, WK, GY, PF)
+                    tl._run(xr, y, ("mvs", (WM, WK, GY, PF)))
+                    y7 = torch.empty_like(y)
+                    tl._run(xr, y7, ("mv", (WM, WK, GY, PF)))
+                    assert torch.equal(y, y7), ("mvs != mv7", B, WM, WK, GY, PF)
+
+
+def test_one_hot_exact_mvh():
+    """mvh (the lean batch <= 8 matrix-vector kernel; runs on any GPU) reproduces columns of W bit-exactly with one-hot
+    inputs, escapes included (none, one in every record, a fifth of all weights: hundreds of entries per record), and
+    equals mv7 bit for bit on random inputs for the same split (uneven splits: tails shorter than the prefetch depth)"""
+    M, N = 256, 1024
+    W1 = weights(M, N, 11)
+    W2 = weights(M, N, 12)
+    W2[torch.rand(M, N, device=DEV) < 0.2] *= 1e-6
+    W3 = weights(M, N, 13)
+    W3.view(M // 16, 16, N // 64, 64)[:, 3, :, 7] = 1e-30          # one escape in every record
+    for W in (W1, W2, W3):
+        tl = TreeLinear.from_linear(_lin(W))
+        for B in (1, 3, 8):
+            x = torch.zeros(B, N, device=DEV, dtype=torch.bfloat16)
+            cols = (torch.arange(B, device=DEV) * 37 + 5) % N
+            x[torch.arange(B), cols] = 1
+            want = W[:, cols].t().contiguous()
+            xr = torch.randn(B, N, device=DEV, dtype=torch.bfloat16)
+            for WM, WK, GY in ((1, 1, 1), (1, 4, 1), (2, 2, 2), (1, 2, 4), (2, 4, 1), (1, 3, 1), (1, 1, 3), (1, 5, 3)):
+                for PF in (2, 4):
+                    y = torch.empty(B, M, device=DEV, dtype=torch.bfloat16)
+                    tl._run(x, y, ("mvh", (WM, WK, GY, PF)))
+                    assert torch.equal(y, want), (B, WM, WK, GY, PF)
+                    tl._run(xr, y, ("mvh", (WM, WK, GY, PF)))
+                    y7 = torch.empty_like(y)
+                    tl._run(xr, y7, ("mv", (WM, WK, GY, PF)))
+                    assert torch.equal(y, y7), ("mvh != mv7", B, WM, WK, GY, PF)
+
+
+def test_one_hot_exact_mvc():
+    """mvc (the record-sweep batch <= 8 kernel; runs on any GPU): one-hot inputs reproduce columns of W bit-exactly,
+    escapes included (none, one per record, a fifth of all weights: more than 32 entries per record), random inputs
+    match the float64 reference, and repeated runs are bit-identical, through tiles per CTA and column splits"""
+    from statetree.linear import _mvc_cfgs
+    M, N = 256, 1024
+    W1 = weights(M, N, 11)
+    W2 = weights(M, N, 12)
+    W2[torch.rand(M, N, device=DEV) < 0.2] *= 1e-6
+    W3 = weights(M, N, 13)
+    W3.view(M // 16, 16, N // 64, 64)[:, 3, :, 7] = 1e-30          # one escape in every record
+    cfgs = [(4, 1, 1, 2), (8, 1, 1, 4), (4, 2, 1, 2), (4, 4, 1, 4), (8, 2, 1, 2), (4, 1, 2, 2), (8, 1, 4, 4), (4, 1, 8, 2)]
+    for W in (W1, W2, W3):
+        tl = TreeLinear.from_linear(_lin(W))
+        for B in (1, 3, 8):
+            x = torch.zeros(B, N, device=DEV, dtype=torch.bfloat16)
+            cols = (torch.arange(B, device=DEV) * 37 + 5) % N
+            x[torch.arange(B), cols] = 1
+            want = W[:, cols].t().contiguous()
+            xr = torch.randn(B, N, device=DEV, dtype=torch.bfloat16)
+            ref = xr.double() @ W.double().t()
+            for prm in cfgs:
+                y = torch.empty(B, M, device=DEV, dtype=torch.bfloat16)
+                tl._run(x, y, ("mvc", prm))
+                assert torch.equal(y, want), ("one-hot", B, prm)
+                tl._run(xr, y, ("mvc", prm))
+                err = float((y.double() - ref).norm() / ref.norm())
+                assert err < 5e-3, (B, prm, err)
+                y2 = torch.empty_like(y)
+                tl._run(xr, y2, ("mvc", prm))
+                assert torch.equal(y, y2), ("nondeterministic", B, prm)
+
+
+def test_mvt_exact():
+    """mvt (the sm_90a TMA record sweep; skipped where it is not built or the GPU is not a Hopper): one-hot inputs
+    reproduce columns of W bit-exactly, escapes included (none, one per record, a fifth of all weights: more than 13
+    entries per chunk), through tiles shared by 2-3 CTAs; random inputs match the float64 reference; runs repeat bit
+    for bit"""
+    from statetree.linear import th_on
+    st = _state(torch.device(DEV))
+    if not th_on(st):
+        return
+    M, N = 256, 1024
+    W1 = weights(M, N, 11)
+    W2 = weights(M, N, 12)
+    W2[torch.rand(M, N, device=DEV) < 0.2] *= 1e-6
+    W3 = weights(M, N, 13)
+    W3.view(M // 16, 16, N // 64, 64)[:, 3, :, 7] = 1e-30          # one escape in every record
+    for W in (W1, W2, W3):
+        tl = TreeLinear.from_linear(_lin(W))
+        for B in (1, 3, 8):
+            x = torch.zeros(B, N, device=DEV, dtype=torch.bfloat16)
+            cols = (torch.arange(B, device=DEV) * 37 + 5) % N
+            x[torch.arange(B), cols] = 1
+            want = W[:, cols].t().contiguous()
+            xr = torch.randn(B, N, device=DEV, dtype=torch.bfloat16)
+            ref = xr.double() @ W.double().t()
+            for C in (1, 3, 7, 16, 21, 32):
+                for S in (2, 4, 8):
+                    y = torch.empty(B, M, device=DEV, dtype=torch.bfloat16)
+                    tl._run(x, y, ("mvt", (C, S)))
+                    assert torch.equal(y, want), ("one-hot", B, C, S)
+                    tl._run(xr, y, ("mvt", (C, S)))
+                    err = float((y.double() - ref).norm() / ref.norm())
+                    assert err < 5e-3, (B, C, S, err)
+                    y2 = torch.empty_like(y)
+                    tl._run(xr, y2, ("mvt", (C, S)))
+                    assert torch.equal(y, y2), ("nondeterministic", B, C, S)
+
+
+def test_th_exact():
+    """th (the sm_90a TMA + wgmma kernel; skipped where it is not built or the GPU is not a Hopper): one-hot inputs
+    reproduce columns of W bit-exactly through every token tile and through split row blocks (few CTAs: stream-K
+    partials merged by the last CTA), escapes included (the fixture's, one in every record, a fifth of all weights:
+    the global escape list), random inputs match the float64 reference, repeated runs are bit-identical"""
+    from statetree.linear import th_on
+    st = _state(torch.device(DEV))
+    if not th_on(st):
+        return
+    M, N = 256, 1024
+    W1 = weights(M, N, 21)
+    W2 = weights(M, N, 22)
+    W2[torch.rand(M, N, device=DEV) < 0.2] *= 1e-6
+    W3 = weights(M, N, 23)
+    W3.view(M // 16, 16, N // 64, 64)[:, 3, :, 7] = 1e-30
+    U = (M // 128) * (N // 64)
+    for W in (W1, W2, W3):
+        tl = TreeLinear.from_linear(_lin(W))
+        for B in (1, 5, 8, 16, 33, 64, 100, 128, 200, 256, 300):
+            cols = (torch.arange(B, device=DEV) * 37 + 5) % N
+            x = torch.zeros(B, N, device=DEV, dtype=torch.bfloat16)
+            x[torch.arange(B), cols] = 1
+            want = W[:, cols].t().contiguous()
+            xr = torch.randn(B, N, device=DEV, dtype=torch.bfloat16)
+            ref = xr.double() @ W.double().t()
+            for nt in (8, 16, 32, 64, 128, 256):
+                if nt < B / 8:
+                    continue
+                for R, Wm in ((1, 0), (2, 0)) if nt <= 32 else ((1, 0), (1, 1)) if nt == 64 else ((1, 1), (1, 2)):
+                    UR = U // R
+                    for C in (1, 3, 7, UR):
+                        if C * -(-B // nt) > st.sms:
+                            continue
+                        y = torch.empty(B, M, device=DEV, dtype=torch.bfloat16)
+                        tl._run(x, y, ("th", (nt, C, R, Wm)))
+                        assert torch.equal(y, want), ("one-hot", B, nt, C, R, Wm)
+                        tl._run(xr, y, ("th", (nt, C, R, Wm)))
+                        err = float((y.double() - ref).norm() / ref.norm())
+                        assert err < 5e-3, (B, nt, C, R, Wm, err)
+                        y2 = torch.empty_like(y)
+                        tl._run(xr, y2, ("th", (nt, C, R, Wm)))
+                        assert torch.equal(y, y2), ("nondeterministic", B, nt, C, R, Wm)
+
 
 def test_convert_save_load():
     torch.manual_seed(0)

@@ -186,6 +186,36 @@ def escape_blocks(M, N, RT, esc_rows, esc_cols, esc_bits):
     return _i32(eb.view(-1)), eou.to(torch.int32).contiguous(), eall
 
 
+def escape_chunks(M, N, esc_rows, esc_cols, esc_bits):
+    """Escape blocks for chunks of 8 consecutive records in memory order (the mvt kernel: unit u = record // 8, i =
+    record % 8; record = tile * NG + column group). Same block format as escape_blocks: EB [U, 16] int32, EOU, EALL."""
+    NG = N // 64
+    dev = esc_rows.device
+    bits, tile, G, s, lane, reg, half = _esc_fields(M, N, esc_rows, esc_cols, esc_bits)
+    r = tile * NG + G
+    u, i = r // 8, r % 8
+    nU = (M // 16) * NG // 8
+    ent = (bits << 16) | (i << 10) | (lane << 5) | (s << 3) | (reg << 1) | half
+    order = torch.argsort(u, stable=True)
+    us, es = u[order], ent[order]
+    cnt = torch.bincount(u, minlength=nU) if u.numel() else torch.zeros(nU, dtype=torch.int64, device=dev)
+    eou = torch.zeros(nU + 1, dtype=torch.int64, device=dev)
+    eou[1:] = cnt.cumsum(0)
+    m = torch.zeros(nU * 64, dtype=torch.bool, device=dev)
+    if u.numel():
+        m[u * 64 + i * 4 + s] = True
+    words = (m.view(nU, 2, 32).long() << torch.arange(32, device=dev)).sum(-1)
+    eb = torch.zeros(nU, 16, dtype=torch.int64, device=dev)
+    eb[:, 0:2] = words
+    eb[:, 2] = cnt
+    if u.numel():
+        pos = torch.arange(us.numel(), device=dev) - eou[us]
+        keep = pos < 13
+        eb[us[keep], 3 + pos[keep]] = es[keep]
+    eall = _i32(es) if es.numel() else torch.zeros(1, dtype=torch.int32, device=dev)
+    return _i32(eb.view(-1)), eou.to(torch.int32).contiguous(), eall
+
+
 def bits_per_weight(M, N, n_esc, esc_bytes=10):
     """Stored size: records + escape list (row, col: 4 B each, bits: 2 B)."""
     return ((M // 16) * (N // 64) * RECORD_BYTES * 8 + n_esc * esc_bytes * 8) / (M * N)
